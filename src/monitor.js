@@ -26,13 +26,16 @@ const wsHub     = require('./wsHub');
 const dataStore = require('./dataStore');
 const heliusWs  = require('./heliusWs');
 
-const FDV_EXIT          = parseFloat(process.env.FDV_EXIT_USD        || '10000');
+const FDV_EXIT          = parseFloat(process.env.FDV_EXIT_USD        || '30000');  // ★ V5: 改为3万
+const LP_EXIT           = parseFloat(process.env.LP_EXIT_USD         || '10000');  // ★ V5: LP<1万退出
 const POLL_SEC          = parseInt(process.env.PRICE_POLL_SEC        || '1',  10);
 const KLINE_SEC         = parseInt(process.env.KLINE_INTERVAL_SEC    || '300', 10);
 const DRY_RUN           = (process.env.DRY_RUN || 'false') === 'true';
 const TRADE_SOL         = parseFloat(process.env.TRADE_SIZE_SOL      || '0.2');
 const SELL_COOLDOWN_SEC = parseInt(process.env.SELL_COOLDOWN_SEC     || '30', 10);
 const SL_POLL_SEC       = parseInt(process.env.SL_POLL_SEC           || '60', 10);
+const MAX_TOKENS        = parseInt(process.env.MAX_MONITOR_TOKENS    || '95', 10);  // ★ V5: 最大监控数
+const OVERVIEW_PATROL_SEC = parseInt(process.env.OVERVIEW_PATROL_SEC || '7200', 10); // ★ V5: FDV/LP巡检间隔(秒)
 
 // 全局交易记录
 const _allTradeRecords = [];
@@ -86,6 +89,12 @@ class TokenMonitor extends EventEmitter {
 
     // ★ V5: 定时持久化状态（每60秒），确保崩溃/重启后不丢失RSI预热和持仓
     this._persistTimer = setInterval(() => this._persistTokens(), 60000);
+
+    // ★ V5: FDV/LP/Age 巡检（每 OVERVIEW_PATROL_SEC 秒一轮，分散请求）
+    this._patrolTimer = null;
+    this._startOverviewPatrol();
+    logger.info('[Monitor]   FDV退出<$%d  LP退出<$%d  最大监控=%d  巡检=%ds',
+      FDV_EXIT, LP_EXIT, MAX_TOKENS, OVERVIEW_PATROL_SEC);
   }
 
   _loadPersistedTokens() {
@@ -102,9 +111,10 @@ class TokenMonitor extends EventEmitter {
           const state = this._tokens.get(t.address);
           if (!state) continue;
 
-          // 恢复 FDV/LP
+          // 恢复 FDV/LP/Age
           if (t.fdv != null) state.fdv = t.fdv;
           if (t.lp != null) state.lp = t.lp;
+          if (t.createdAt != null) state.createdAt = t.createdAt;
 
           // ★ 不恢复 RSI 缓存（_rsiAvgGain 等）— 从 ticks 重新计算
           //   旧缓存的 lastClose 跟当前价格可能差很远，stepRSI 会算出虚高RSI
@@ -155,6 +165,7 @@ class TokenMonitor extends EventEmitter {
         // ★ V5: 保存运行状态，重启后不丢失
         fdv:            s.fdv,
         lp:             s.lp,
+        createdAt:      s.createdAt,
         inPosition:     s.inPosition,
         position:       s.position,
         tradeCount:     s.tradeCount,
@@ -171,6 +182,7 @@ class TokenMonitor extends EventEmitter {
     if (this._pollTimer) { clearTimeout(this._pollTimer); this._pollTimer = null; }
     if (this._slPollTimer) { clearInterval(this._slPollTimer); this._slPollTimer = null; }
     if (this._persistTimer) { clearInterval(this._persistTimer); this._persistTimer = null; }
+    if (this._patrolTimer) { clearTimeout(this._patrolTimer); this._patrolTimer = null; }
     this._persistTokens();  // ★ V5: 关闭前最后保存一次
     birdeye.priceStream.stop();
     heliusWs.stop();
@@ -183,6 +195,15 @@ class TokenMonitor extends EventEmitter {
       return false;
     }
 
+    // ★ V5: 最大监控数检查
+    if (this._tokens.size >= MAX_TOKENS) {
+      const evicted = this._evictForNewToken();
+      if (!evicted) {
+        logger.warn('[Monitor] %s 无法添加：监控已满(%d/%d)', symbol, this._tokens.size, MAX_TOKENS);
+        return false;
+      }
+    }
+
     const now = Date.now();
     const state = {
       address,
@@ -190,6 +211,7 @@ class TokenMonitor extends EventEmitter {
       meta,
       fdv               : meta.fdv ?? null,
       lp                : meta.lp  ?? null,
+      createdAt         : meta.createdAt ?? null,  // ★ V5: 代币创建时间(ms)
       addedAt           : now,
       ticks             : [],
       inPosition        : false,
@@ -594,12 +616,20 @@ class TokenMonitor extends EventEmitter {
       dataStore.appendTick(address, { price, ts: now, source: 'price', symbol: state.symbol });
     }
 
-    // 4. FDV 检查（★ 只用缓存值，不主动发 HTTP 请求，买入前才强制刷新）
-    //    getCachedFdv 返回 null 表示缓存未命中或已过期 → 跳过检查，等买入前再刷
+    // 4. FDV/LP 检查（只用缓存值，巡检会定期刷新）
     const fdv = birdeye.getCachedFdv(address);
-    if (fdv !== null && Number.isFinite(fdv) && fdv < FDV_EXIT) {
-      logger.warn('[Monitor] %s FDV=$%s < $%s，退出', state.symbol, fdv, FDV_EXIT);
-      await this.removeToken(address, `FDV_TOO_LOW($${Math.round(fdv)})`);
+    if (fdv !== null && Number.isFinite(fdv)) {
+      state.fdv = fdv;  // 更新state
+      if (fdv < FDV_EXIT) {
+        logger.warn('[Monitor] %s FDV=$%d < $%d，退出', state.symbol, Math.round(fdv), FDV_EXIT);
+        await this.removeToken(address, `FDV_TOO_LOW($${Math.round(fdv)})`);
+        return;
+      }
+    }
+    // LP 退出检查（用 state 中巡检更新的值）
+    if (state.lp !== null && Number.isFinite(state.lp) && state.lp < LP_EXIT) {
+      logger.warn('[Monitor] %s LP=$%d < $%d，退出', state.symbol, Math.round(state.lp), LP_EXIT);
+      await this.removeToken(address, `LP_TOO_LOW($${Math.round(state.lp)})`);
       return;
     }
 
@@ -639,6 +669,7 @@ class TokenMonitor extends EventEmitter {
       price,
       fdv,
       lp:          state.lp,
+      createdAt:   state.createdAt,
       rsi:         Number.isFinite(rsi) ? parseFloat(rsi.toFixed(2)) : null,
       prevRsi:     Number.isFinite(prevRsi) ? parseFloat(prevRsi.toFixed(2)) : null,
       signal,
@@ -864,6 +895,7 @@ class TokenMonitor extends EventEmitter {
       address:    state.address,
       symbol:     state.symbol,
       tradeNum:   state.tradeCount,
+      createdAt:  state.createdAt,  // ★ V5: 代币创建时间
       buyAt:      state.position.buyTime,
       buyTxid:    state.position.buyTxid,
       entryPrice: state.position.entryPriceUsd,
@@ -915,6 +947,7 @@ class TokenMonitor extends EventEmitter {
       address:      state.address,
       symbol:       state.symbol,
       addedAt:      state.addedAt,
+      createdAt:    state.createdAt,
       inPosition:   state.inPosition,
       tradeCount:   state.tradeCount,
       cooldown:     state._sellCooldownUntil > now ? Math.ceil((state._sellCooldownUntil - now) / 1000) : 0,
@@ -923,11 +956,103 @@ class TokenMonitor extends EventEmitter {
       dryRun:       DRY_RUN,
       lastPrice:    state._lastPriceUsd,
       lastPriceTs:  state._lastPriceTs,
+      fdv:          state.fdv,
+      lp:           state.lp,
     };
   }
 
   _broadcastTokenList() {
     wsHub.broadcast({ type: 'token_list', tokens: this.getTokens() });
+  }
+
+  // ── ★ V5: FDV/LP/Age 巡检（分散请求，每轮间隔 OVERVIEW_PATROL_SEC）──────
+
+  _startOverviewPatrol() {
+    // 启动后延迟30秒开始第一轮巡检（等WS连接稳定）
+    this._patrolTimer = setTimeout(() => this._runOverviewPatrol(), 30000);
+  }
+
+  async _runOverviewPatrol() {
+    if (!this._started) return;
+    const addresses = Array.from(this._tokens.keys());
+    if (addresses.length === 0) {
+      this._patrolTimer = setTimeout(() => this._runOverviewPatrol(), OVERVIEW_PATROL_SEC * 1000);
+      return;
+    }
+
+    // 分散请求：每个币之间间隔 2 秒，95个币约3分钟完成一轮
+    const INTERVAL_PER_TOKEN = 2000;
+    logger.info('[Patrol] 开始 FDV/LP/Age 巡检，%d 个代币，预计 %ds',
+      addresses.length, Math.ceil(addresses.length * INTERVAL_PER_TOKEN / 1000));
+
+    for (let i = 0; i < addresses.length; i++) {
+      if (!this._started) return;
+      const address = addresses[i];
+      const state = this._tokens.get(address);
+      if (!state) continue;
+
+      try {
+        const overview = await birdeye.getOverview(address);
+        if (!overview) continue;
+
+        // 更新 state
+        if (overview.fdv !== null && Number.isFinite(overview.fdv)) state.fdv = overview.fdv;
+        if (overview.liquidity !== null && Number.isFinite(overview.liquidity)) state.lp = overview.liquidity;
+        if (overview.createdAt && !state.createdAt) state.createdAt = overview.createdAt;
+
+        // ★ FDV 退出检查
+        if (state.fdv !== null && Number.isFinite(state.fdv) && state.fdv < FDV_EXIT) {
+          logger.warn('[Patrol] %s FDV=$%d < $%d，退出监控', state.symbol, Math.round(state.fdv), FDV_EXIT);
+          await this.removeToken(address, `FDV_TOO_LOW($${Math.round(state.fdv)})`);
+          continue;
+        }
+
+        // ★ LP 退出检查
+        if (state.lp !== null && Number.isFinite(state.lp) && state.lp < LP_EXIT) {
+          logger.warn('[Patrol] %s LP=$%d < $%d，退出监控', state.symbol, Math.round(state.lp), LP_EXIT);
+          await this.removeToken(address, `LP_TOO_LOW($${Math.round(state.lp)})`);
+          continue;
+        }
+
+        logger.debug('[Patrol] %s FDV=$%s LP=$%s age=%s',
+          state.symbol,
+          state.fdv ? Math.round(state.fdv) : '?',
+          state.lp ? Math.round(state.lp) : '?',
+          state.createdAt ? Math.round((Date.now() - state.createdAt) / 3600000) + 'h' : '?');
+      } catch (err) {
+        logger.warn('[Patrol] %s 巡检失败: %s', state.symbol, err.message);
+      }
+
+      // 等待间隔再查下一个
+      if (i < addresses.length - 1) {
+        await new Promise(r => setTimeout(r, INTERVAL_PER_TOKEN));
+      }
+    }
+
+    logger.info('[Patrol] 巡检完成，下次 %ds 后', OVERVIEW_PATROL_SEC);
+    this._patrolTimer = setTimeout(() => this._runOverviewPatrol(), OVERVIEW_PATROL_SEC * 1000);
+  }
+
+  // ── ★ V5: 监控数满时清理（按24h交易笔数倒序清理最不活跃的）──────
+
+  _evictForNewToken() {
+    if (this._tokens.size < MAX_TOKENS) return true; // 有空位
+
+    // 按交易笔数排序，找到最不活跃且没有持仓的代币
+    const candidates = Array.from(this._tokens.values())
+      .filter(s => !s.inPosition && !s._selling)  // 不清理有持仓的
+      .sort((a, b) => (a.tradeCount || 0) - (b.tradeCount || 0));  // 交易最少的排前面
+
+    if (candidates.length === 0) {
+      logger.warn('[Monitor] 监控已满(%d/%d)且所有代币都持仓中，无法清理', this._tokens.size, MAX_TOKENS);
+      return false;
+    }
+
+    const victim = candidates[0];
+    logger.info('[Monitor] 🧹 监控已满(%d/%d)，清理最不活跃代币 %s（%d笔交易）',
+      this._tokens.size, MAX_TOKENS, victim.symbol, victim.tradeCount || 0);
+    this.removeToken(victim.address, `EVICTED(trades=${victim.tradeCount||0})`);
+    return true;
   }
 }
 

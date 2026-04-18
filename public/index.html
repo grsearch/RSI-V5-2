@@ -92,7 +92,7 @@
     </div>
     <table id="tbl-tokens">
       <thead><tr>
-        <th>代币</th><th>合约</th><th>价格</th><th>FDV</th><th>LP</th>
+        <th>代币</th><th>合约</th><th>价格</th><th>FDV</th><th>LP</th><th>Age</th>
         <th>RSI</th><th>prevRSI</th><th>Buy/Sell</th><th>信号</th><th>原因</th>
         <th>K线</th><th>交易</th><th>状态</th><th>操作</th>
       </tr></thead>
@@ -290,6 +290,16 @@ function fmtFdv(v){ if(v==null||v===undefined)return'-'; if(v>=1e6)return'$'+(v/
 function addrShort(a){ return a ? a.slice(0,4)+'...'+a.slice(-4) : '-' }
 function gmgnUrl(a){ return `https://gmgn.ai/sol/token/${a}` }
 
+function fmtAge(createdAt) {
+  if (!createdAt) return '-';
+  const ms = Date.now() - createdAt;
+  if (ms < 0) return '-';
+  const hours = ms / 3600000;
+  if (hours < 1) return Math.round(hours * 60) + 'm';
+  if (hours < 24) return hours.toFixed(1) + 'h';
+  return (hours / 24).toFixed(1) + 'd';
+}
+
 // ── 代币列表：排序 + 取当前页 ──
 function _getSortedTokens() {
   const arr = Array.from(_tokenData.values());
@@ -333,7 +343,7 @@ function _renderTokenPage() {
     if (!tr) {
       tr = document.createElement('tr');
       tr.id = 'row-' + d.address;
-      for (let i = 0; i < 14; i++) tr.appendChild(document.createElement('td'));
+      for (let i = 0; i < 15; i++) tr.appendChild(document.createElement('td'));
     }
     _updateTickCells(tr, d);
     // 确保顺序正确
@@ -375,24 +385,25 @@ function _updateTickCells(tr, d) {
   cells[2].textContent = fmt(d.price, 8);
   cells[3].textContent = fmtFdv(d.fdv); cells[3].className = 'fdv-val';
   cells[4].textContent = fmtFdv(d.lp);  cells[4].className = 'lp-val';
-  cells[5].textContent = rsi == null ? '预热' : rsi.toFixed(2);
-  cells[5].className = rsiClass(rsi);
-  cells[6].textContent = d.prevRsi == null ? '-' : d.prevRsi.toFixed(2);
-  cells[6].className = rsiClass(d.prevRsi);
-  cells[7].textContent = bsStr;
-  cells[7].className = volClass(bv, sv);
-  cells[7].title = `Buy/Sell SOL (${d.volume?.windowSec||30}s)`;
-  cells[8].textContent = sig;
-  cells[8].className = sig.toLowerCase();
-  cells[9].textContent = d.reason || '';
-  cells[9].style.cssText = 'color:#8b949e;font-size:11px;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
-  cells[9].title = d.reason || '';
-  cells[10].textContent = d.closedCount ?? '-';
-  cells[11].textContent = (d.tradeCount || 0) + '笔';
-  cells[11].style.fontSize = '11px';
-  cells[12].innerHTML = posStr;
-  if (!cells[13].firstChild) {
-    cells[13].innerHTML = `<button onclick="deleteToken('${d.address}')" style="background:#4d1c1c;border:1px solid #f85149;color:#f85149;padding:2px 8px;border-radius:3px;cursor:pointer;font-size:11px" title="移除监控">✕</button>`;
+  cells[5].textContent = fmtAge(d.createdAt); cells[5].style.cssText = 'color:#8b949e;font-size:11px';
+  cells[6].textContent = rsi == null ? '预热' : rsi.toFixed(2);
+  cells[6].className = rsiClass(rsi);
+  cells[7].textContent = d.prevRsi == null ? '-' : d.prevRsi.toFixed(2);
+  cells[7].className = rsiClass(d.prevRsi);
+  cells[8].textContent = bsStr;
+  cells[8].className = volClass(bv, sv);
+  cells[8].title = `Buy/Sell SOL (${d.volume?.windowSec||30}s)`;
+  cells[9].textContent = sig;
+  cells[9].className = sig.toLowerCase();
+  cells[10].textContent = d.reason || '';
+  cells[10].style.cssText = 'color:#8b949e;font-size:11px;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+  cells[10].title = d.reason || '';
+  cells[11].textContent = d.closedCount ?? '-';
+  cells[12].textContent = (d.tradeCount || 0) + '笔';
+  cells[12].style.fontSize = '11px';
+  cells[13].innerHTML = posStr;
+  if (!cells[14].firstChild) {
+    cells[14].innerHTML = `<button onclick="deleteToken('${d.address}')" style="background:#4d1c1c;border:1px solid #f85149;color:#f85149;padding:2px 8px;border-radius:3px;cursor:pointer;font-size:11px" title="移除监控">✕</button>`;
   }
 }
 

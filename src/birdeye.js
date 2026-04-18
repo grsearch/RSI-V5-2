@@ -209,8 +209,12 @@ async function _fetchOverview(address) {
     const entry = {
       fdv:       data.fdv ?? data.mc ?? null,
       liquidity: data.liquidity ?? data.lp ?? null,
+      // ★ V5: 代币创建时间（秒级时间戳 → 毫秒）
+      createdAt: data.createdAt ? data.createdAt * 1000 : (data.createAt ? data.createAt * 1000 : null),
       ts:        Date.now(),
     };
+    // 保留旧缓存中的 createdAt（不会变）
+    if (!entry.createdAt && cached?.createdAt) entry.createdAt = cached.createdAt;
     _overviewCache.set(address, entry);
     return entry;
   } catch (err) {
@@ -290,4 +294,9 @@ function clearCache(address) {
   _priceHttpCache.delete(address);
 }
 
-module.exports = { getPrice, getFdv, getCachedFdv, getFdvFresh, getLiquidity, clearCache, priceStream };
+/** 获取完整 overview（fdv + lp + createdAt），走缓存 */
+async function getOverview(address) {
+  return await _fetchOverview(address);
+}
+
+module.exports = { getPrice, getFdv, getCachedFdv, getFdvFresh, getLiquidity, getOverview, clearCache, priceStream };
