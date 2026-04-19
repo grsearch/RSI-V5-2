@@ -181,10 +181,10 @@ function runBacktest(ticks, params) {
 
       let exitReason = null;
 
-      // RSI > panic
-      if (rsiRT > rsiPanic && candleOT !== lastSellCandle) {
+      // RSI > panic — ★ 用已收盘K线RSI，不用stepRSI（与live一致）
+      if (rsiArray[ci] > rsiPanic && candleOT !== lastSellCandle) {
         lastSellCandle = candleOT;
-        exitReason = `RSI_PANIC(${rsiRT.toFixed(1)})`;
+        exitReason = `RSI_PANIC(${rsiArray[ci].toFixed(1)})`;
       }
       // RSI 下穿 sell
       if (!exitReason && prevRsi >= rsiSell && rsiRT < rsiSell && candleOT !== lastSellCandle) {
@@ -205,18 +205,9 @@ function runBacktest(ticks, params) {
         if (pnl >= takeProfitPct) exitReason = `TAKE_PROFIT(${pnl.toFixed(1)}%)`;
         else if (pnl <= stopLossPct) exitReason = `STOP_LOSS(${pnl.toFixed(1)}%)`;
       }
-      // 卖压超过买压：sellVol >= volSellMult × buyVol
-      if (!exitReason && volEnabled && candleOT !== lastSellCandle) {
-        const start = Math.max(0, ci - windowBars + 1);
-        const wc = candles.slice(start, ci + 1);
-        let wb = 0, ws = 0;
-        for (const c of wc) { wb += (c.buyVolume||0); ws += (c.sellVolume||0); }
-        if ((wb + ws) > 0 && ws >= wb * volSellMult) {
-          lastSellCandle = candleOT;
-          const m = wb > 0 ? (ws/wb).toFixed(1) : '∞';
-          exitReason = `SELL_PRESSURE(${m}x,${ws.toFixed(1)}/${wb.toFixed(1)})`;
-        }
-      }
+      // 卖压 — 已禁用
+      // if (!exitReason && volEnabled && candleOT !== lastSellCandle) { ... }
+
       // 量能萎缩
       if (!exitReason && volEnabled && ci >= volExitLookback + volExitConsecutive) {
         const ae = ci - volExitConsecutive + 1;
@@ -233,9 +224,12 @@ function runBacktest(ticks, params) {
 
       if (exitReason) {
         const solOut = tradeSizeSol * (price / entryPrice);
+        // 计算持仓K线数
+        const entryCI = closedIdx(entryTime);
+        const holdBars = entryCI >= 0 ? ci - entryCI : Math.round((ts - entryTime) / (klineSec * 1000));
         trades.push({
           entryPrice, exitPrice: price, entryTime, exitTime: ts,
-          holdMs: ts - entryTime,
+          holdMs: ts - entryTime, holdBars,
           solIn: tradeSizeSol, solOut,
           pnlSol: solOut - tradeSizeSol,
           pnlPct: (price - entryPrice) / entryPrice * 100,
@@ -279,9 +273,12 @@ function runBacktest(ticks, params) {
   if (inPosition && priceTicks.length > 0) {
     const last = priceTicks[priceTicks.length - 1];
     const solOut = tradeSizeSol * (last.price / entryPrice);
+    const entryCI = closedIdx(entryTime);
+    const lastCI  = closedIdx(last.ts);
+    const holdBars = (entryCI >= 0 && lastCI >= 0) ? lastCI - entryCI : Math.round((last.ts - entryTime) / (klineSec * 1000));
     trades.push({
       entryPrice, exitPrice: last.price, entryTime, exitTime: last.ts,
-      holdMs: last.ts - entryTime,
+      holdMs: last.ts - entryTime, holdBars,
       solIn: tradeSizeSol, solOut,
       pnlSol: solOut - tradeSizeSol,
       pnlPct: (last.price - entryPrice) / entryPrice * 100,
