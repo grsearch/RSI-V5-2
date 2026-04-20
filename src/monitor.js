@@ -21,6 +21,7 @@ const _RSI_SELL  = RSI_CONFIG.RSI_SELL;
 const _RSI_PANIC = RSI_CONFIG.RSI_PANIC;
 const trader    = require('./trader');
 const birdeye   = require('./birdeye');
+const HIST_BARS = parseInt(process.env.HIST_BARS || '150', 10); // 启动时拉取的历史K线根数
 const logger    = require('./logger');
 const wsHub     = require('./wsHub');
 const dataStore = require('./dataStore');
@@ -32,7 +33,7 @@ const POLL_SEC          = parseInt(process.env.PRICE_POLL_SEC        || '1',  10
 const KLINE_SEC         = parseInt(process.env.KLINE_INTERVAL_SEC    || '300', 10);
 const DRY_RUN           = (process.env.DRY_RUN || 'false') === 'true';
 const TRADE_SOL         = parseFloat(process.env.TRADE_SIZE_SOL      || '0.2');
-const SELL_COOLDOWN_SEC = parseInt(process.env.SELL_COOLDOWN_SEC     || '30', 10);
+const SELL_COOLDOWN_SEC = parseInt(process.env.SELL_COOLDOWN_SEC     || '1800', 10); // 默认30分钟
 const SL_POLL_SEC       = parseInt(process.env.SL_POLL_SEC           || '60', 10);
 const MAX_TOKENS        = parseInt(process.env.MAX_MONITOR_TOKENS    || '95', 10);  // ★ V5: 最大监控数
 const OVERVIEW_PATROL_SEC = parseInt(process.env.OVERVIEW_PATROL_SEC || '7200', 10); // ★ V5: FDV/LP巡检间隔(秒)
@@ -149,6 +150,14 @@ class TokenMonitor extends EventEmitter {
               }
             }
           } catch (_) {}
+
+          // ★ 重启后重新拉取历史K线（historicalCandles 不持久化，重启必须重拉）
+          birdeye.getOHLCV(t.address, KLINE_SEC, HIST_BARS).then(histCandles => {
+            const s = this._tokens.get(t.address);
+            if (!s || !histCandles || histCandles.length === 0) return;
+            s.historicalCandles = histCandles;
+            logger.info('[Monitor] ♻️ %s 历史K线重载: %d 根', t.symbol, histCandles.length);
+          }).catch(() => {});
         }
       }
     } catch (err) {
@@ -214,6 +223,7 @@ class TokenMonitor extends EventEmitter {
       createdAt         : meta.createdAt ?? null,  // ★ V5: 代币创建时间(ms)
       addedAt           : now,
       ticks             : [],
+      historicalCandles : [],  // ★ 启动时从 Birdeye 拉取的历史K线（用于EMA99/RSI预热）
       inPosition        : false,
       position          : null,
       tradeCount        : 0,       // 完成的买卖轮次数
@@ -250,7 +260,37 @@ class TokenMonitor extends EventEmitter {
       this._onChainTrade(address, trade);
     });
 
-    logger.info('[Monitor] ➕ 开始监控 %s (%s) | DRY_RUN=%s',
+    // ★ 异步拉取 overview（Age/FDV/LP）+ 历史K线（EMA99/RSI预热）
+    (async () => {
+      const s = this._tokens.get(address);
+      if (!s) return;
+
+      // 1. 拉取 overview
+      try {
+        const ov = await birdeye.getOverview(address);
+        if (ov) {
+          if (ov.createdAt) s.createdAt = ov.createdAt;
+          if (ov.fdv !== null && Number.isFinite(ov.fdv)) s.fdv = ov.fdv;
+          if (ov.liquidity !== null && Number.isFinite(ov.liquidity)) s.lp = ov.liquidity;
+          logger.debug('[Monitor] %s overview初始化: fdv=$%s age=%s',
+            symbol,
+            s.fdv ? Math.round(s.fdv) : '?',
+            s.createdAt ? Math.round((Date.now() - s.createdAt) / 3600000) + 'h' : '?');
+        }
+      } catch (_) {}
+
+      // 2. 拉取历史K线（用于 EMA99/RSI 预热，无需等待K线自然积累）
+      try {
+        const histCandles = await birdeye.getOHLCV(address, KLINE_SEC, HIST_BARS);
+        if (histCandles && histCandles.length > 0) {
+          s.historicalCandles = histCandles;
+          logger.info('[Monitor] %s 历史K线预热: %d 根 (EMA99/RSI立即可用)',
+            symbol, histCandles.length);
+        }
+      } catch (_) {}
+    })();
+
+    logger.info("[Monitor] ➕ 开始监控 %s (%s) | DRY_RUN=%s",
       symbol, address, DRY_RUN);
     this._broadcastTokenList();
     this._persistTokens();  // ★ 保存到磁盘
@@ -482,7 +522,14 @@ class TokenMonitor extends EventEmitter {
         // ── 2. RSI 卖出检查（双重方式：已收盘K线 + stepRSI实时估算） ──
         if (state.ticks.length > 0) {
           const { closed: rawCandles } = buildCandles(state.ticks, KLINE_SEC);
-          const closedCandles = filterValidCandles(rawCandles);
+          const liveCandles = filterValidCandles(rawCandles);
+          // ★ 合并历史K线
+          let closedCandles = liveCandles;
+          if (state.historicalCandles && state.historicalCandles.length > 0) {
+            const liveStart2 = liveCandles.length > 0 ? liveCandles[0].openTime : Infinity;
+            const histFiltered2 = state.historicalCandles.filter(c => c.openTime < liveStart2);
+            closedCandles = [...histFiltered2, ...liveCandles];
+          }
           if (closedCandles.length >= RSI_CONFIG.RSI_PERIOD + 2) {
             const closes = closedCandles.map(c => c.close);
             const { rsiArray, avgGain, avgLoss } = calcRSIWithState(closes);
@@ -642,9 +689,16 @@ class TokenMonitor extends EventEmitter {
       else if (idx === -1) state.ticks.length = 0;  // 全部过期
     }
 
-    // 6. 聚合 K 线
+    // 6. 聚合 K 线（历史K线 + 实时ticks合并）
     const { closed: rawClosedCandles, current: currentCandle } = buildCandles(state.ticks, KLINE_SEC);
-    const closedCandles = filterValidCandles(rawClosedCandles);
+    const liveClosed = filterValidCandles(rawClosedCandles);
+    // ★ 合并历史K线：历史candles在前，实时candles在后，去除时间重叠部分
+    let closedCandles = liveClosed;
+    if (state.historicalCandles && state.historicalCandles.length > 0) {
+      const liveStart = liveClosed.length > 0 ? liveClosed[0].openTime : Infinity;
+      const histFiltered = state.historicalCandles.filter(c => c.openTime < liveStart);
+      closedCandles = [...histFiltered, ...liveClosed];
+    }
 
     // 7. RSI + 量能信号评估
     const realtimePrice = currentCandle?.close ?? price;
@@ -998,7 +1052,7 @@ class TokenMonitor extends EventEmitter {
         // 更新 state
         if (overview.fdv !== null && Number.isFinite(overview.fdv)) state.fdv = overview.fdv;
         if (overview.liquidity !== null && Number.isFinite(overview.liquidity)) state.lp = overview.liquidity;
-        if (overview.createdAt && !state.createdAt) state.createdAt = overview.createdAt;
+        if (overview.createdAt) state.createdAt = overview.createdAt; // ★ 始终更新，确保Age数据存在
 
         // ★ FDV 退出检查
         if (state.fdv !== null && Number.isFinite(state.fdv) && state.fdv < FDV_EXIT) {
@@ -1033,25 +1087,38 @@ class TokenMonitor extends EventEmitter {
     this._patrolTimer = setTimeout(() => this._runOverviewPatrol(), OVERVIEW_PATROL_SEC * 1000);
   }
 
-  // ── ★ V5: 监控数满时清理（按24h交易笔数倒序清理最不活跃的）──────
+  // ── ★ V6: 监控数满时清理（按24h链上交易量(SOL)排序，清理量最小的）──────
+
+  _evict24hVolume(state) {
+    // 统计 state.ticks 中过去24小时的链上交易量(SOL)
+    const cutoff = Date.now() - 24 * 3600 * 1000;
+    let vol = 0;
+    for (const t of state.ticks) {
+      if (t.source === 'chain' && t.ts >= cutoff && t.solAmount > 0) {
+        vol += t.solAmount;
+      }
+    }
+    return vol;
+  }
 
   _evictForNewToken() {
     if (this._tokens.size < MAX_TOKENS) return true; // 有空位
 
-    // 按交易笔数排序，找到最不活跃且没有持仓的代币
+    // 按24h链上交易量升序排，量最小的（最不活跃）优先被清理
     const candidates = Array.from(this._tokens.values())
-      .filter(s => !s.inPosition && !s._selling)  // 不清理有持仓的
-      .sort((a, b) => (a.tradeCount || 0) - (b.tradeCount || 0));  // 交易最少的排前面
+      .filter(s => !s.inPosition && !s._selling)  // 不清理持仓中的
+      .map(s => ({ state: s, vol24h: this._evict24hVolume(s) }))
+      .sort((a, b) => a.vol24h - b.vol24h);  // 交易量最小的排前面
 
     if (candidates.length === 0) {
       logger.warn('[Monitor] 监控已满(%d/%d)且所有代币都持仓中，无法清理', this._tokens.size, MAX_TOKENS);
       return false;
     }
 
-    const victim = candidates[0];
-    logger.info('[Monitor] 🧹 监控已满(%d/%d)，清理最不活跃代币 %s（%d笔交易）',
-      this._tokens.size, MAX_TOKENS, victim.symbol, victim.tradeCount || 0);
-    this.removeToken(victim.address, `EVICTED(trades=${victim.tradeCount||0})`);
+    const { state: victim, vol24h } = candidates[0];
+    logger.info('[Monitor] 🧹 监控已满(%d/%d)，清理24h量最低代币 %s（%.2f SOL）',
+      this._tokens.size, MAX_TOKENS, victim.symbol, vol24h);
+    this.removeToken(victim.address, `EVICTED(vol24h=${vol24h.toFixed(2)}SOL)`);
     return true;
   }
 }

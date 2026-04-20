@@ -39,6 +39,19 @@ const TRAILING_STOP_ENABLED  = (process.env.TRAILING_STOP_ENABLED  || 'true') ==
 const TRAILING_STOP_ACTIVATE = parseFloat(process.env.TRAILING_STOP_ACTIVATE || '30'); // 上涨 30% 后激活
 const TRAILING_STOP_PCT      = parseFloat(process.env.TRAILING_STOP_PCT      || '-20'); // 峰值回撤 20% 清仓
 
+// EMA99 买入过滤：价格必须在 EMA99 下方才允许买入
+const EMA_PERIOD = parseInt(process.env.EMA_PERIOD || '99', 10);
+
+function calcEMA(closes, period) {
+  if (closes.length < period) return NaN;
+  const k = 2 / (period + 1);
+  let ema = closes.slice(0, period).reduce((s, v) => s + v, 0) / period;
+  for (let i = period; i < closes.length; i++) {
+    ema = closes[i] * k + ema * (1 - k);
+  }
+  return ema;
+}
+
 // ── Wilder RSI 计算 ────────────────────────────────────────────────
 
 function calcRSIWithState(closes, period = RSI_PERIOD) {
@@ -326,6 +339,14 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState) {
   // ★ RSI < 30（超卖区）+ buyVol >= 1.2 × sellVol
   if (!tokenState.inPosition) {
     if (rsiRealtime < RSI_BUY && lastCandleTs !== lastBuyCandle) {
+      // ★ EMA99 过滤：价格必须在 EMA99 下方才允许买入
+      const ema99 = calcEMA(closes, EMA_PERIOD);
+      if (Number.isFinite(ema99) && realtimePrice >= ema99) {
+        updateState();
+        return { rsi: rsiRealtime, prevRsi, signal: null,
+                 reason: `PRICE_ABOVE_EMA99(price=${realtimePrice.toFixed(8)},ema99=${ema99.toFixed(8)})`, volume: volumeInfo };
+      }
+
       const volCheck = checkBuyVolume(closedCandles, null);
       volumeInfo.buyVol   = volCheck.buyVol;
       volumeInfo.sellVol  = volCheck.sellVol;
@@ -335,7 +356,7 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState) {
         tokenState._lastBuyCandle = lastCandleTs;
         updateState();
         return { rsi: rsiRealtime, prevRsi, signal: 'BUY',
-                 reason: `RSI_OVERSOLD(${rsiRealtime.toFixed(1)}<${RSI_BUY})+${volCheck.reason}`, volume: volumeInfo };
+                 reason: `RSI_OVERSOLD(${rsiRealtime.toFixed(1)}<${RSI_BUY})+EMA99OK+${volCheck.reason}`, volume: volumeInfo };
       }
       // 量能不达标，不标记 lastBuyCandle，下根K线继续检查
     }
@@ -469,5 +490,6 @@ module.exports = {
     SKIP_FIRST_CANDLES,
     TAKE_PROFIT_PCT, STOP_LOSS_PCT, KLINE_SEC,
     TRAILING_STOP_ENABLED, TRAILING_STOP_ACTIVATE, TRAILING_STOP_PCT,
+    EMA_PERIOD,
   },
 };

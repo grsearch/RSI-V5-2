@@ -52,7 +52,8 @@ function runBacktest(ticks, params) {
     volBuyMult     = 1.2,
     volSellMult    = 1.2,
     volMinTotal    = 5,
-    sellCooldownSec = 30,
+    sellCooldownSec = 1800,  // 默认30分钟冷却期
+    emaPeriod      = 99,    // EMA99 买入过滤
   } = params;
 
   if (!ticks || ticks.length === 0) return null;
@@ -64,6 +65,17 @@ function runBacktest(ticks, params) {
     const nag = (ag * (period-1) + (d>0?d:0)) / period;
     const nal = (al * (period-1) + (d<0?Math.abs(d):0)) / period;
     return nal === 0 ? 100 : 100 - 100 / (1 + nag / nal);
+  }
+
+  // ── EMA 计算 ─────────────────────────────────────────────────
+  function calcEMA(closes, period) {
+    if (closes.length < period) return NaN;
+    const k = 2 / (period + 1);
+    let ema = closes.slice(0, period).reduce((s, v) => s + v, 0) / period;
+    for (let i = period; i < closes.length; i++) {
+      ema = closes[i] * k + ema * (1 - k);
+    }
+    return ema;
   }
 
   // ── 构建 K 线（区分 price / chain tick） ───────────────────
@@ -247,6 +259,12 @@ function runBacktest(ticks, params) {
     // ── BUY ──────────────────────────────────────────────
     if (!inPosition && trades.length < maxTrades) {
       if (rsiRT < rsiBuy && ts >= cooldownUntil && candleOT !== lastBuyCandle) {
+        // ★ EMA99 过滤：价格必须在 EMA99 下方
+        const ema99 = calcEMA(closes, emaPeriod);
+        if (Number.isFinite(ema99) && price >= ema99) {
+          prevRsiRT = rsiRT;
+          continue;
+        }
         if (volEnabled) {
           // 检查量能
           const start = Math.max(0, ci - windowBars + 1);
@@ -398,8 +416,8 @@ function gridSearchFromTicks(allTicks) {
       klineSec: 60, volEnabled: true,
       volSellMult: 8888, volMinTotal: 5, volWindowSec: 120,
       volExitConsecutive: 3, volExitRatio: 0.3, volExitLookback: 4,
-      tradeSizeSol: 0.2, maxTrades: 99999, sellCooldownSec: 30,
-      takeProfitPct: 99999,
+      tradeSizeSol: 0.2, maxTrades: 99999, sellCooldownSec: 1800, // 30分钟冷却
+      takeProfitPct: 99999, emaPeriod: 99, // ★ EMA99 过滤启用
       ...combo,
     };
 

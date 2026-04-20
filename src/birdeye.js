@@ -299,4 +299,100 @@ async function getOverview(address) {
   return await _fetchOverview(address);
 }
 
-module.exports = { getPrice, getFdv, getCachedFdv, getFdvFresh, getLiquidity, getOverview, clearCache, priceStream };
+// ── 历史 OHLCV K 线拉取 ──────────────────────────────────────────
+// Birdeye /defi/ohlcv 接口，返回历史 K 线数据
+// type 映射：秒数 → Birdeye type 字符串
+const KLINE_TYPE_MAP = {
+  60:    '1m',
+  180:   '3m',
+  300:   '5m',
+  900:   '15m',
+  1800:  '30m',
+  3600:  '1H',
+  7200:  '2H',
+  14400: '4H',
+  21600: '6H',
+  28800: '8H',
+  43200: '12H',
+  86400: '1D',
+};
+
+/**
+ * 拉取历史 K 线，返回 candle 数组（可直接合并进 closedCandles）
+ * @param {string} address - 代币地址
+ * @param {number} intervalSec - K 线宽度（秒），如 300 = 5分钟
+ * @param {number} bars - 需要拉取的 K 线根数，如 150
+ * @returns {Array} candles - [{ openTime, closeTime, open, high, low, close, volume, buyVolume, sellVolume }]
+ */
+async function getOHLCV(address, intervalSec, bars = 150) {
+  const type = KLINE_TYPE_MAP[intervalSec];
+  if (!type) {
+    // 没有精确匹配，找最接近的
+    const keys = Object.keys(KLINE_TYPE_MAP).map(Number).sort((a, b) => a - b);
+    const closest = keys.reduce((prev, curr) =>
+      Math.abs(curr - intervalSec) < Math.abs(prev - intervalSec) ? curr : prev
+    );
+    logger.warn('[Birdeye] getOHLCV: %ds 无对应类型，使用 %ds (%s)', intervalSec, closest, KLINE_TYPE_MAP[closest]);
+    return getOHLCV(address, closest, bars);
+  }
+
+  const now       = Math.floor(Date.now() / 1000);
+  const time_from = now - intervalSec * (bars + 5); // 多拉5根，确保有足够数据
+  const time_to   = now;
+
+  const url = `${BASE}/defi/ohlcv?address=${address}&type=${type}&time_from=${time_from}&time_to=${time_to}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+
+  try {
+    const res = await fetch(url, {
+      headers: { 'X-API-KEY': BIRDEYE_KEY, 'x-chain': 'solana' },
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      logger.warn('[Birdeye] getOHLCV %s 返回 %d', address.slice(0, 8), res.status);
+      return [];
+    }
+    const json = await res.json();
+    const items = json?.data?.items || [];
+    if (items.length === 0) {
+      logger.warn('[Birdeye] getOHLCV %s 无数据', address.slice(0, 8));
+      return [];
+    }
+
+    // 转换为系统 candle 格式
+    const candles = items.map(item => {
+      const openTime  = item.unixTime * 1000;          // 秒 → 毫秒
+      const closeTime = openTime + intervalSec * 1000;
+      return {
+        openTime,
+        closeTime,
+        open:       item.o,
+        high:       item.h,
+        low:        item.l,
+        close:      item.c,
+        volume:     item.v || 0,     // Birdeye OHLCV 的 v 是总量
+        buyVolume:  0,               // 历史数据无买卖方向分离，置0
+        sellVolume: 0,
+        tickCount:  1,
+        priceTickCount: 1,
+        fromHistory: true,           // 标记为历史数据
+      };
+    });
+
+    // 按时间升序排列，去掉最后一根（可能未收盘）
+    candles.sort((a, b) => a.openTime - b.openTime);
+    const closed = candles.slice(0, -1); // 去掉最后一根未收盘K线
+
+    logger.info('[Birdeye] getOHLCV %s type=%s 拉取 %d 根历史K线 (请求%d根)',
+      address.slice(0, 8) + '...', type, closed.length, bars);
+    return closed;
+  } catch (err) {
+    logger.warn('[Birdeye] getOHLCV %s 失败: %s', address.slice(0, 8), err.message);
+    return [];
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+module.exports = { getPrice, getFdv, getCachedFdv, getFdvFresh, getLiquidity, getOverview, clearCache, priceStream, getOHLCV };

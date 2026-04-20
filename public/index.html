@@ -201,7 +201,14 @@
       </div>
       <div>
         <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:3px">卖出冷却(秒)</label>
-        <input type="number" id="bt-cooldown" value="30" min="0" max="300" step="5" style="width:100%;background:#0d1117;border:1px solid #30363d;color:#e6edf3;padding:5px 8px;border-radius:4px;font-size:13px">
+        <input type="number" id="bt-cooldown" value="1800" min="0" max="7200" step="60" style="width:100%;background:#0d1117;border:1px solid #30363d;color:#e6edf3;padding:5px 8px;border-radius:4px;font-size:13px">
+      </div>
+      <div>
+        <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:3px">EMA99 过滤</label>
+        <select id="bt-ema-enabled" style="width:100%;background:#0d1117;border:1px solid #30363d;color:#e6edf3;padding:5px 8px;border-radius:4px;font-size:13px">
+          <option value="true" selected>开启（价格&lt;EMA99才买）</option>
+          <option value="false">关闭</option>
+        </select>
       </div>
       <div style="display:flex;align-items:flex-end">
         <button onclick="runBacktest()" id="bt-run-btn" style="width:100%;background:#1a4731;border:1px solid #3fb950;color:#3fb950;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:13px;font-weight:bold">▶ 运行回测</button>
@@ -735,6 +742,8 @@ function runBacktest() {
     sellCooldownSec:    parseInt(document.getElementById('bt-cooldown').value),
     volEnabled:         true,
     tradeSizeSol:       0.2,
+    emaEnabled:         document.getElementById('bt-ema-enabled').value === 'true',
+    emaPeriod:          99,
   };
 
   fetch('/api/backtest/run', {
