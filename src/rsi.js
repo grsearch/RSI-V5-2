@@ -23,7 +23,7 @@ const KLINE_SEC    = parseInt(process.env.KLINE_INTERVAL_SEC || '300', 10);
 const VOL_ENABLED         = (process.env.VOL_ENABLED || 'true') === 'true';
 const VOL_BUY_MULT        = parseFloat(process.env.VOL_BUY_MULT          || '1.2');
 const VOL_SELL_MULT       = parseFloat(process.env.VOL_SELL_MULT         || '999'); // sellVol >= N × buyVol 触发卖出（默认999=禁用）
-const VOL_MIN_TOTAL       = parseFloat(process.env.VOL_MIN_TOTAL         || '15');  // 最低总成交量(SOL) // buyVol >= N × sellVol 才买入
+const VOL_MIN_TOTAL       = parseFloat(process.env.VOL_MIN_TOTAL         || '5');   // 最低总成交量(SOL)，买入窗口内 buyVol+sellVol >= N SOL
 const VOL_WINDOW_SEC      = parseInt(process.env.VOL_WINDOW_SEC       || '300', 10);
 const VOL_EXIT_CONSECUTIVE = parseInt(process.env.VOL_EXIT_CONSECUTIVE || '2', 10);
 const VOL_EXIT_RATIO      = parseFloat(process.env.VOL_EXIT_RATIO     || '1.0');
@@ -353,10 +353,12 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState) {
       volumeInfo.buyRatio = volCheck.ratio;
 
       if (volCheck.pass) {
-        tokenState._lastBuyCandle = lastCandleTs;
+        // ★ 注意：不在此处标记 _lastBuyCandle，由 monitor._canBuy 通过冷却检查后再标记
+        // 这样冷却期内不会白白消耗K线槽位，冷却结束后第一根满足条件的K线即可买入
         updateState();
         return { rsi: rsiRealtime, prevRsi, signal: 'BUY',
-                 reason: `RSI_OVERSOLD(${rsiRealtime.toFixed(1)}<${RSI_BUY})+EMA99OK+${volCheck.reason}`, volume: volumeInfo };
+                 reason: `RSI_OVERSOLD(${rsiRealtime.toFixed(1)}<${RSI_BUY})+EMA99OK+${volCheck.reason}`,
+                 volume: volumeInfo, candleTs: lastCandleTs };
       }
       // 量能不达标，不标记 lastBuyCandle，下根K线继续检查
     }

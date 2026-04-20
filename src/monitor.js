@@ -702,7 +702,7 @@ class TokenMonitor extends EventEmitter {
 
     // 7. RSI + 量能信号评估
     const realtimePrice = currentCandle?.close ?? price;
-    const { rsi, prevRsi, signal, reason, volume } = evaluateSignal(closedCandles, realtimePrice, state);
+    const { rsi, prevRsi, signal, reason, volume, candleTs: signalCandleTs } = evaluateSignal(closedCandles, realtimePrice, state);
 
     // 8. 记录信号
     if (reason && reason !== '' && reason !== 'rsi_rebase') {
@@ -747,6 +747,12 @@ class TokenMonitor extends EventEmitter {
 
     // 10. 执行信号
     if (signal === 'BUY' && !state.inPosition && this._canBuy(state, now)) {
+      // ★ 冷却通过后才标记 _lastBuyCandle，防止冷却期内白白消耗K线槽位
+      {
+        const lastCandle = signalCandleTs ?? (closedCandles && closedCandles.length > 0
+          ? closedCandles[closedCandles.length - 1].openTime : -1);
+        state._lastBuyCandle = lastCandle;
+      }
       // ★ 买入前强制刷新 FDV（绕过缓存，确保数据最新）
       const freshFdv = await birdeye.getFdvFresh(address);
       if (freshFdv !== null && Number.isFinite(freshFdv) && freshFdv < FDV_EXIT) {
