@@ -362,55 +362,111 @@ class HeliusTradeStream {
     const preBalances   = meta.preBalances  || [];
     const postBalances  = meta.postBalances || [];
 
-    // ── 1. 计算 token 净变化（所有账户合计）──────────────────────
+    // ── 1. 找到"用户账户"的 token 净变化 ─────────────────────────
+    //   AMM swap 的本质：一方(用户)的 token 余额变化 = 另一方(池子)变化的反数
+    //   取用户侧(usually 非 pool、非 mint authority)的变化作为成交量基准
     const postEntries = postTokenBals.filter(b => b.mint === tokenAddress);
     const preEntries  = preTokenBals.filter(b => b.mint === tokenAddress);
     if (postEntries.length === 0) return null;
 
-    // 取最大单笔 token 变化（通常是用户账户，AMM 池子方向相反）
-    let maxBuyDelta = 0, maxSellDelta = 0;
+    // 计算每个账户的 delta
+    const tokenDeltas = [];
     for (const postEntry of postEntries) {
       const preEntry = preEntries.find(b =>
         b.accountIndex === postEntry.accountIndex || b.owner === postEntry.owner);
       const postAmt = parseFloat((postEntry.uiTokenAmount && postEntry.uiTokenAmount.uiAmount) || '0');
       const preAmt  = preEntry ? parseFloat((preEntry.uiTokenAmount && preEntry.uiTokenAmount.uiAmount) || '0') : 0;
       const delta = postAmt - preAmt;
-      if (delta > maxBuyDelta)  maxBuyDelta  = delta;
-      if (delta < maxSellDelta) maxSellDelta = delta;
+      if (Math.abs(delta) > 1e-9) {
+        tokenDeltas.push({ delta, owner: postEntry.owner, accountIndex: postEntry.accountIndex });
+      }
     }
+    if (tokenDeltas.length === 0) return null;
 
-    // 净 token 变化：买入时用户账户增加（正），卖出时减少（负）
-    const tokenDelta = Math.abs(maxBuyDelta) >= Math.abs(maxSellDelta) ? maxBuyDelta : maxSellDelta;
-    if (Math.abs(tokenDelta) < 1e-9) return null;
+    // ★ FIX: 正负 delta 应该大致相等（一方给，一方收），取绝对值最大者作为"用户侧"
+    //   注意：多跳 swap 会产生多个 pool 账户变化，但单笔交易的用户净变化仍是唯一的
+    //   正确口径是"所有正 delta 之和 与 所有负 delta 之和，取绝对值较小的那个"
+    //   （较大的那个会因为路由过程中的临时累加而虚高）
+    let sumPositive = 0, sumNegative = 0;
+    for (const d of tokenDeltas) {
+      if (d.delta > 0) sumPositive += d.delta;
+      else sumNegative += d.delta;
+    }
+    // 成交 token 量 = min(|正变化总和|, |负变化总和|)
+    //   理想情况两者相等；若不等(手续费、转账)，取较小者避免虚高
+    const absTokenDelta = Math.min(Math.abs(sumPositive), Math.abs(sumNegative));
+    if (absTokenDelta < 1e-9) return null;
 
-    // ── 2. 计算 SOL 金额 ─────────────────────────────────────────
-    // 策略1：找最大单账户 SOL 变化（Pump AMM：买入时用户 SOL 减少，卖出时增加）
-    // 不用总和，因为买卖双方抵消后净值接近0（只剩手续费）
-    let maxNativeSolChange = 0;
+    // 买卖方向：用户侧变化为正 = 买入；用户侧一般是绝对值最大的那个账户（非 pool）
+    // 简化：绝对值最大的 delta 的符号代表用户侧方向
+    let userDelta = tokenDeltas[0].delta;
+    for (const d of tokenDeltas) {
+      if (Math.abs(d.delta) > Math.abs(userDelta)) userDelta = d.delta;
+    }
+    const isBuy = userDelta > 0;
+
+    // ── 2. 计算 SOL 金额（两条策略取其中"真实成交"的那个）───────
+    //
+    //   ★ 关键修复：原版用 Math.abs 累加所有 WSOL 账户变化，会把 1 SOL 成交
+    //     算成 2 SOL(用户-1、pool+1 两边都 abs) 甚至更多(多跳路由累加)
+    //
+    //   正确口径：用户侧 SOL 变化 = 成交额
+    //     native SOL: 单账户最大变化（Pump AMM 用户直接转 SOL）
+    //     WSOL:       取所有 WSOL 账户正/负 delta 之和的较小绝对值
+    //                 （和 token 同理：一方给一方收，min 才是真实成交额）
+
+    // native SOL：扣掉 tip/fee 的影响，只看大额账户
+    // 我们只关心"可能是用户"的变化，通常用户账户 SOL 变化 >= 0.0001 SOL 才算有效
+    //   tip 账户(Jito MEV)一般 < 0.01 SOL，priority fee 通常 < 0.001 SOL
+    //   取"第二大"而不是最大能更稳，但简化起见用最大且设下限
+    const MIN_SOL_DELTA = 0.0001;
+    let nativeSolDelta = 0;
     for (let i = 0; i < preBalances.length && i < postBalances.length; i++) {
       const delta = Math.abs(postBalances[i] - preBalances[i]) / LAMPORTS;
-      if (delta > maxNativeSolChange) maxNativeSolChange = delta;
+      if (delta > MIN_SOL_DELTA && delta > nativeSolDelta) nativeSolDelta = delta;
     }
 
-    // 策略2：WSOL token 余额净变化（Meteora/Raydium CLMM 等）
-    let wsolNetDelta = 0;
+    // WSOL: 正/负两侧分别求和，取较小绝对值
+    let wsolSumPos = 0, wsolSumNeg = 0;
     const wsolPost = postTokenBals.filter(b => b.mint === WSOL);
     const wsolPre  = preTokenBals.filter(b => b.mint === WSOL);
     for (const wp of wsolPost) {
       const wr = wsolPre.find(b => b.accountIndex === wp.accountIndex || b.owner === wp.owner);
       const postAmt = parseFloat((wp.uiTokenAmount && wp.uiTokenAmount.uiAmount) || '0');
       const preAmt  = wr ? parseFloat((wr.uiTokenAmount && wr.uiTokenAmount.uiAmount) || '0') : 0;
-      wsolNetDelta += Math.abs(postAmt - preAmt);
+      const d = postAmt - preAmt;
+      if (d > 0) wsolSumPos += d;
+      else wsolSumNeg += d;
+    }
+    // 处理 pre 里有但 post 里没了的 WSOL 账户（WSOL 账户被关闭 sync）
+    for (const wr of wsolPre) {
+      const found = wsolPost.find(b => b.accountIndex === wr.accountIndex || b.owner === wr.owner);
+      if (!found) {
+        const preAmt = parseFloat((wr.uiTokenAmount && wr.uiTokenAmount.uiAmount) || '0');
+        if (preAmt > 0) wsolSumNeg -= preAmt;  // 账户被关，等同于 -preAmt
+      }
+    }
+    const wsolNetDelta = Math.min(Math.abs(wsolSumPos), Math.abs(wsolSumNeg));
+
+    // ── 3. 最终 solAmount：两条策略取其中"看起来合理"的那个 ─────
+    //   策略选择逻辑：
+    //   - Pump AMM 直接用 native SOL → nativeSolDelta 大、wsolNetDelta 为 0
+    //   - Raydium/Meteora 用 WSOL   → wsolNetDelta 大、nativeSolDelta 只是 fee
+    //   - 套利/MEV 混合              → 两者都有，取较小者更接近真实用户成交额
+    //   取两者中有效且较小的那一个（>MIN_SOL_DELTA 才算有效）
+    let solAmount = 0;
+    const candidates = [nativeSolDelta, wsolNetDelta].filter(v => v > MIN_SOL_DELTA);
+    if (candidates.length === 2) {
+      // 两条策略都有数据：取较小者（避免策略相加导致翻倍）
+      //   但如果较小的明显太小（< 较大的 10%）说明它是 fee，用较大者
+      const [a, b] = candidates.sort((x, y) => x - y);
+      solAmount = (a / b < 0.1) ? b : a;
+    } else if (candidates.length === 1) {
+      solAmount = candidates[0];
     }
 
-    // ── 3. 判断买卖方向 ───────────────────────────────────────────
-    const isBuy  = tokenDelta > 0;
-    const isSell = tokenDelta < 0;
+    if (solAmount <= 0) return null;
 
-    // 取两个策略中较大的 SOL 金额
-    const solAmount = Math.max(maxNativeSolChange, wsolNetDelta);
-
-    const absTokenDelta = Math.abs(tokenDelta);
     return {
       ts: Date.now(), signature, tokenAddress,
       owner: postEntries[0]?.owner || '',

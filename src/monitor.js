@@ -426,6 +426,11 @@ class TokenMonitor extends EventEmitter {
 
     state.ticks.push(tick);
 
+    // ★ FIX: 链上交易到达就实时更新 _lastVolume（滑动窗口），
+    //   这样 token_list 广播 / tick 广播 / REST 接口都能立刻看到最新买卖量，
+    //   不用等下一次 _poll 跑 buildCandles+evaluateSignal 才显示。
+    this._refreshLiveVolume(state, now);
+
     dataStore.appendTick(address, {
       ...tick,
       symbol:    state.symbol,
@@ -718,20 +723,42 @@ class TokenMonitor extends EventEmitter {
     if (!state._lastVolLog || Date.now() - state._lastVolLog > 60000) {
       state._lastVolLog = Date.now();
       const chainTicks = state.ticks.filter(t => t.source === 'chain');
+      const windowMs = (parseInt(process.env.VOL_WINDOW_SEC || '300', 10)) * 1000;
+      const cutoff = Date.now() - windowMs;
+      const winChainTicks = chainTicks.filter(t => t.ts >= cutoff);
+      let winBuy = 0, winSell = 0;
+      for (const t of winChainTicks) {
+        const amt = t.solAmount || 0;
+        if (t.isBuy) winBuy += amt; else winSell += amt;
+      }
       const rawChainBuys  = rawForVolume.filter(c => !c.fromHistory).reduce((s,c)=>s+(c.buyVolume||0),0);
       const rawChainSells = rawForVolume.filter(c => !c.fromHistory).reduce((s,c)=>s+(c.sellVolume||0),0);
-      logger.info('[VolDiag] %s | chainTicks=%d | rawCandles=%d(live=%d,hist=%d) | buyVol=%.4f sellVol=%.4f | currentCandle=%s',
+      logger.info('[VolDiag] %s | chainTicks:all=%d,win=%d | tick路径=B%.3f/S%.3f | K线路径=B%.3f/S%.3f | win=%ds',
         state.symbol,
         chainTicks.length,
-        rawForVolume.length,
-        rawForVolume.filter(c=>!c.fromHistory).length,
-        rawForVolume.filter(c=>c.fromHistory).length,
+        winChainTicks.length,
+        winBuy, winSell,
         rawChainBuys, rawChainSells,
-        currentCandle ? `open=${new Date(currentCandle.openTime).toISOString().slice(11,19)} buy=${(currentCandle.buyVolume||0).toFixed(4)} sell=${(currentCandle.sellVolume||0).toFixed(4)}` : 'null'
+        windowMs/1000
       );
     }
 
     const { rsi, prevRsi, signal, reason, volume, candleTs: signalCandleTs } = evaluateSignal(closedCandles, realtimePrice, state, rawForVolume);
+
+    // ★ FIX: 缓存到 state，让 _stateSnapshot (getTokens/token_list/REST) 也能读到量能
+    state._lastRsi         = Number.isFinite(rsi)     ? parseFloat(rsi.toFixed(2))     : null;
+    state._lastPrevRsi     = Number.isFinite(prevRsi) ? parseFloat(prevRsi.toFixed(2)) : null;
+    state._lastSignal      = signal || null;
+    state._lastReason      = reason || '';
+    state._lastClosedCount = closedCandles.length;
+
+    // ★ FIX: 显示层统一用 _refreshLiveVolume —— 严格 VOL_WINDOW_SEC 秒的滑动窗口
+    //   不再和 evaluateSignal 返回的 K 线量能做 Math.max 合并，避免：
+    //     1. 两条路径窗口不同，取 max 会把数据虚高
+    //     2. K 线 currentCandle 窗口随机（0~300s），显示"300s"容易误导
+    //   信号判断 (evaluateSignal 内部) 仍然用 K 线聚合，两者职责分离
+    this._refreshLiveVolume(state, now, true);
+    const displayVolume = state._lastVolume;
 
     // 8. 记录信号
     if (reason && reason !== '' && reason !== 'rsi_rebase') {
@@ -759,7 +786,7 @@ class TokenMonitor extends EventEmitter {
       reason,
       closedCount: closedCandles.length,
       inPosition:  state.inPosition,
-      volume,
+      volume:      displayVolume,
       tradeCount:  state.tradeCount,
       cooldown:    state._sellCooldownUntil > now ? Math.ceil((state._sellCooldownUntil - now) / 1000) : 0,
       dryRun:      DRY_RUN,
@@ -1047,6 +1074,14 @@ class TokenMonitor extends EventEmitter {
       lastPriceTs:  state._lastPriceTs,
       fdv:          state.fdv,
       lp:           state.lp,
+      // ★ FIX: 带上最近一次计算的 RSI / 信号 / 量能，避免 token_list 广播时前端看不到数据
+      price:        state._lastPriceUsd,
+      rsi:          Number.isFinite(state._lastRsi)     ? state._lastRsi     : null,
+      prevRsi:      Number.isFinite(state._lastPrevRsi) ? state._lastPrevRsi : null,
+      signal:       state._lastSignal || null,
+      reason:       state._lastReason || '',
+      volume:       state._lastVolume || {},
+      closedCount:  state._lastClosedCount ?? null,
     };
   }
 
@@ -1122,6 +1157,41 @@ class TokenMonitor extends EventEmitter {
 
     logger.info('[Patrol] 巡检完成，下次 %ds 后', OVERVIEW_PATROL_SEC);
     this._patrolTimer = setTimeout(() => this._runOverviewPatrol(), OVERVIEW_PATROL_SEC * 1000);
+  }
+
+  // ── ★ FIX: 实时量能刷新（滑动窗口，不依赖K线聚合） ──────────
+  //   窗口默认 VOL_WINDOW_SEC（秒），从 state.ticks 里的链上交易直接累加
+  //   每次链上 tick 到达、或 _poll 每轮都会调用（带节流，避免高频扫描）
+  //   force=true 时强制刷新（_poll 主路径调用时使用）
+  _refreshLiveVolume(state, now, force = false) {
+    // 节流：链上高频 tick 时，每 250ms 最多刷新一次；_poll 调用时 force=true 跳过节流
+    if (!force && state._lastVolumeRefreshTs && (now - state._lastVolumeRefreshTs) < 250) {
+      return;
+    }
+    state._lastVolumeRefreshTs = now;
+
+    const windowMs = (parseInt(process.env.VOL_WINDOW_SEC || '300', 10)) * 1000;
+    const cutoff = now - windowMs;
+    let buyVol = 0, sellVol = 0, txCount = 0;
+    // state.ticks 是按时间顺序追加的，从后往前扫直到超出窗口
+    for (let i = state.ticks.length - 1; i >= 0; i--) {
+      const t = state.ticks[i];
+      if (t.ts < cutoff) break;
+      if (t.source !== 'chain') continue;
+      const amt = t.solAmount || 0;
+      if (amt <= 0) continue;
+      if (t.isBuy) buyVol += amt; else sellVol += amt;
+      txCount++;
+    }
+    const total = buyVol + sellVol;
+    state._lastVolume = {
+      currentVol: total,
+      buyVol, sellVol,
+      buyRatio: total > 0 ? buyVol / total : 0,
+      windowSec: windowMs / 1000,
+      txCount,
+      stale: false,
+    };
   }
 
   // ── ★ V6: 监控数满时清理（按24h链上交易量(SOL)排序，清理量最小的）──────

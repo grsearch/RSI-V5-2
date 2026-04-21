@@ -220,13 +220,18 @@ function checkStopLoss(currentPrice, tokenState) {
 // ── 主信号函数 ─────────────────────────────────────────────────────
 
 function evaluateSignal(closedCandles, realtimePrice, tokenState, rawCandles) {
+  // ★ FIX: 先计算 volumeInfo，这样即便 RSI 预热/数据不足，前端也能显示量能
+  const windowBars = Math.max(1, Math.ceil(VOL_WINDOW_SEC / KLINE_SEC));
+  const _rawForVol = rawCandles || closedCandles;
+  const volumeInfo = calcVolumeInfo(_rawForVol, windowBars, KLINE_SEC);
+
   const MIN_CANDLES = RSI_PERIOD + 2;
   if (!closedCandles || closedCandles.length < MIN_CANDLES) {
-    return { rsi: NaN, prevRsi: NaN, signal: null, reason: 'warming_up', volume: {} };
+    return { rsi: NaN, prevRsi: NaN, signal: null, reason: 'warming_up', volume: volumeInfo };
   }
 
   if (closedCandles.length < SKIP_FIRST_CANDLES) {
-    return { rsi: NaN, prevRsi: NaN, signal: null, reason: `skip_first(${closedCandles.length}/${SKIP_FIRST_CANDLES})`, volume: {} };
+    return { rsi: NaN, prevRsi: NaN, signal: null, reason: `skip_first(${closedCandles.length}/${SKIP_FIRST_CANDLES})`, volume: volumeInfo };
   }
 
   const closes = closedCandles.map(c => c.close);
@@ -248,7 +253,7 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState, rawCandles) {
   const rsiRealtime = stepRSI(avgGain, avgLoss, lastClose, realtimePrice, RSI_PERIOD);
 
   if (!Number.isFinite(lastClosedRsi) || !Number.isFinite(rsiRealtime)) {
-    return { rsi: NaN, prevRsi: NaN, signal: null, reason: 'rsi_nan', volume: {},
+    return { rsi: NaN, prevRsi: NaN, signal: null, reason: 'rsi_nan', volume: volumeInfo,
              avgGain: NaN, avgLoss: NaN, lastClose: NaN };
   }
 
@@ -267,11 +272,7 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState, rawCandles) {
     tokenState._prevRsiTs       = nowMs;
   };
 
-  // 量能信息：从原始K线（rawCandles）单独计算，不依赖 RSI 用的 closedCandles
-  // 这样量能数据（含无价格的链上K线）和 RSI（仅有价格的K线）完全分离
-  const windowBars = Math.max(1, Math.ceil(VOL_WINDOW_SEC / KLINE_SEC));
-  const _rawForVol = rawCandles || closedCandles; // 兼容未传 rawCandles 的情况
-  const volumeInfo = calcVolumeInfo(_rawForVol, windowBars, KLINE_SEC);
+  // 量能信息已在函数开头计算，这里直接使用 volumeInfo / windowBars / _rawForVol
 
   // ── SELL 优先（持仓中） ────────────────────────────────────────
   if (tokenState.inPosition) {
@@ -470,10 +471,13 @@ function calcVolumeInfo(rawCandles, windowBars, klineSec) {
   // ★ 先过滤出实时K线（非历史）
   const liveCandles = rawCandles.filter(c => !c.fromHistory);
 
-  // 用标准窗口（VOL_WINDOW_SEC 对应的K线根数）
-  // 若标准窗口内无数据，最多往前扩展到8根，但只取最近有数据的那一根
-  // 目的是：K线收盘瞬间不显示空白，用上一根K线的量能过渡
-  const stdLookback = Math.min(liveCandles.length, windowBars);
+  if (liveCandles.length === 0) {
+    return { currentVol: 0, buyVol: 0, sellVol: 0, buyRatio: 0, windowSec: 0, stale: false };
+  }
+
+  // ★ FIX: 标准窗口至少取 windowBars 根，但也保证至少 1 根（当前未收盘K线）
+  //   累加窗口内所有K线的 buyVolume/sellVolume（不是只看一根）
+  const stdLookback = Math.max(1, Math.min(liveCandles.length, windowBars));
   let wc = liveCandles.slice(-stdLookback);
 
   let winBuy = 0, winSell = 0;
@@ -482,30 +486,42 @@ function calcVolumeInfo(rawCandles, windowBars, klineSec) {
     winSell += (c.sellVolume || 0);
   }
 
-  // 若标准窗口内无数据，往前最多找8根，取最近一根有量能的K线
+  let stale = false;
+  // ★ FIX: 若标准窗口内无数据，往前最多找12根，累加最近一段有量能的K线之和
+  //   （而不是只取单一一根，避免"0.1/0.0"这种失真）
   if (winBuy + winSell === 0 && liveCandles.length > stdLookback) {
-    const extLookback = Math.min(liveCandles.length, 8);
+    const extLookback = Math.min(liveCandles.length, Math.max(12, stdLookback * 2));
     const extCandles = liveCandles.slice(-extLookback);
+    // 从最新往回找到连续有量能的段：一旦发现第一根有量能的K线，就收集它及之后所有K线的量能
+    let firstNonZeroIdx = -1;
     for (let i = extCandles.length - 1; i >= 0; i--) {
       const c = extCandles[i];
       if ((c.buyVolume || 0) + (c.sellVolume || 0) > 0) {
-        winBuy  = c.buyVolume  || 0;
-        winSell = c.sellVolume || 0;
-        wc = [c];
+        firstNonZeroIdx = i;
         break;
       }
+    }
+    if (firstNonZeroIdx >= 0) {
+      wc = extCandles.slice(firstNonZeroIdx);
+      winBuy = 0; winSell = 0;
+      for (const c of wc) {
+        winBuy  += (c.buyVolume  || 0);
+        winSell += (c.sellVolume || 0);
+      }
+      stale = true; // 标记为回溯数据，非当前窗口
     }
   }
 
   const winTotal = winBuy + winSell;
-  const currentVol = wc.length > 0 ? wc[wc.length - 1].volume || 0 : 0;
+  const currentVol = wc.length > 0 ? (wc[wc.length - 1].volume || 0) : 0;
 
   return {
     currentVol,
     buyVol:   winBuy,
     sellVol:  winSell,
     buyRatio: winTotal > 0 ? winBuy / winTotal : 0,
-    windowSec: stdLookback * klineSec,
+    windowSec: wc.length * klineSec,
+    stale,
   };
 }
 

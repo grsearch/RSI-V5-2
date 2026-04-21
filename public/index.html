@@ -380,7 +380,17 @@ function _updateTickCells(tr, d) {
   const rsi = d.rsi;
   const bv = d.volume?.buyVol ?? 0;
   const sv = d.volume?.sellVol ?? 0;
-  const bsStr = (bv+sv) > 0 ? `${bv.toFixed(1)}/${sv.toFixed(1)}` : '-';
+  // ★ FIX: 量能格式化 —— 根据量级自适应小数位，避免 "0.1/0.0" 这种误导性四舍五入
+  const fmtVol = v => {
+    if (v == null || !isFinite(v)) return '0';
+    if (v >= 100) return v.toFixed(0);
+    if (v >= 10)  return v.toFixed(1);
+    if (v >= 1)   return v.toFixed(2);
+    if (v > 0)    return v.toFixed(3);
+    return '0';
+  };
+  const bsStr = (bv + sv) > 0 ? `${fmtVol(bv)}/${fmtVol(sv)}` : '-';
+  const staleMark = d.volume?.stale ? ' *' : '';
   const posStr = d.inPosition
     ? '<span class="badge green">持仓</span>'
     : (d.cooldown > 0 ? '<span class="badge yellow">冷却</span>' : '<span class="badge gray">观望</span>');
@@ -397,9 +407,11 @@ function _updateTickCells(tr, d) {
   cells[6].className = rsiClass(rsi);
   cells[7].textContent = d.prevRsi == null ? '-' : d.prevRsi.toFixed(2);
   cells[7].className = rsiClass(d.prevRsi);
-  cells[8].textContent = bsStr;
+  cells[8].textContent = bsStr + staleMark;
   cells[8].className = volClass(bv, sv);
-  cells[8].title = `Buy/Sell SOL (${d.volume?.windowSec||30}s)`;
+  const volWindow = d.volume?.windowSec || 300;
+  const volTx = d.volume?.txCount ?? '?';
+  cells[8].title = `Buy/Sell SOL · 窗口${volWindow}s · ${volTx}笔${d.volume?.stale?' [历史回溯]':''}`;
   cells[9].textContent = sig;
   cells[9].className = sig.toLowerCase();
   cells[10].textContent = d.reason || '';
@@ -440,8 +452,9 @@ function connect(){
   ws.onmessage = e => {
     const d = JSON.parse(e.data);
     if (d.type === 'tick') {
-      // 更新数据存储
-      _tokenData.set(d.address, d);
+      // ★ FIX: 合并而非覆盖，避免 tick 缺某些字段（如 fdv/lp/createdAt）时清掉旧数据
+      const existing = _tokenData.get(d.address) || {};
+      _tokenData.set(d.address, { ...existing, ...d });
       // 节流渲染
       _scheduleTokenRender();
     }
@@ -507,6 +520,15 @@ function handleTokenList(tokens){
   // 移除已不在监控中的代币数据
   for (const addr of _tokenData.keys()) {
     if (!addrs.has(addr)) _tokenData.delete(addr);
+  }
+  // ★ FIX: 把 token_list 的数据填充到 _tokenData，避免 WS 重连或初次加载时，
+  //   在第一条 tick 到来前前端拿不到 volume/rsi 等字段
+  //   已有更新的 tick 数据就保留（按 ts 判断）
+  for (const t of tokens) {
+    const existing = _tokenData.get(t.address);
+    if (!existing || (t.lastPriceTs || 0) >= (existing.ts || 0)) {
+      _tokenData.set(t.address, { ...existing, ...t, ts: t.lastPriceTs || Date.now() });
+    }
   }
   _scheduleTokenRender();
 }
