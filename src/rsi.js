@@ -477,24 +477,24 @@ function buildCandles(ticks, intervalSec = KLINE_SEC) {
 }
 
 /**
- * 过滤掉 open 为 null 的 K 线（只有链上 tick，没有价格数据的 K 线）
- * RSI 计算前调用
- * ★ 修复：被过滤的K线的 buyVolume/sellVolume 合并到前一根有效K线，防止量能数据丢失
+ * 过滤K线用于 RSI/EMA 计算：
+ *   - 有价格数据的K线：正常保留
+ *   - 只有链上交易、无价格的K线：把量能合并到前一根有价格的K线，自身丢弃
+ * 这样既保证 RSI 计算有正确的 close 价格，又不丢失链上交易的量能数据
  */
 function filterValidCandles(candles) {
   const valid = [];
   for (const c of candles) {
     if (c.open !== null && c.close !== null) {
       valid.push(c);
-    } else {
-      // 无价格数据的K线：把量能合并到上一根有效K线
-      if (valid.length > 0 && (c.volume > 0 || c.buyVolume > 0 || c.sellVolume > 0)) {
-        const prev = valid[valid.length - 1];
-        prev.volume     = (prev.volume     || 0) + (c.volume     || 0);
-        prev.buyVolume  = (prev.buyVolume  || 0) + (c.buyVolume  || 0);
-        prev.sellVolume = (prev.sellVolume || 0) + (c.sellVolume || 0);
-      }
+    } else if (valid.length > 0) {
+      // 无价格K线：量能并入前一根有效K线，防止链上交易数据丢失
+      const prev = valid[valid.length - 1];
+      prev.volume     = (prev.volume     || 0) + (c.volume     || 0);
+      prev.buyVolume  = (prev.buyVolume  || 0) + (c.buyVolume  || 0);
+      prev.sellVolume = (prev.sellVolume || 0) + (c.sellVolume || 0);
     }
+    // 若 valid 为空且无价格，直接丢弃（没有前一根可合并）
   }
   return valid;
 }
