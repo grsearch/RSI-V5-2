@@ -419,6 +419,7 @@ class HeliusTradeStream {
   }
 
   _extractTrade(tokenAddress, meta, txData, signature) {
+    const WSOL = 'So11111111111111111111111111111111111111112';
     const preTokenBals  = meta.preTokenBalances  || [];
     const postTokenBals = meta.postTokenBalances  || [];
     const preBalances   = meta.preBalances  || [];
@@ -434,6 +435,18 @@ class HeliusTradeStream {
     const postEntries = postTokenBals.filter(b => b.mint === tokenAddress);
     const preEntries  = preTokenBals.filter(b => b.mint === tokenAddress);
     if (postEntries.length === 0) return null;
+
+    // ★ 预计算 WSOL 净变化（用于 Meteora/Raydium 等不走原生 SOL 的 AMM）
+    // WSOL 账户余额变化 = 交易实际支付/收到的 SOL
+    let wsolNetDelta = 0;
+    const wsolPost = postTokenBals.filter(b => b.mint === WSOL);
+    const wsolPre  = preTokenBals.filter(b => b.mint === WSOL);
+    for (const wp of wsolPost) {
+      const wr = wsolPre.find(b => b.accountIndex === wp.accountIndex || b.owner === wp.owner);
+      const postAmt = parseFloat(wp.uiTokenAmount?.uiAmount ?? '0');
+      const preAmt  = wr ? parseFloat(wr.uiTokenAmount?.uiAmount ?? '0') : 0;
+      wsolNetDelta += postAmt - preAmt;
+    }
 
     for (const postEntry of postEntries) {
       const owner = postEntry.owner;
@@ -451,7 +464,14 @@ class HeliusTradeStream {
       const tokenDelta = postAmt - preAmt;
       if (Math.abs(tokenDelta) < 1e-12) continue;
 
-      const solDelta = (postBalances[ownerIndex] - preBalances[ownerIndex]) / LAMPORTS;
+      // 优先用原生 SOL 余额变化
+      let solDelta = (postBalances[ownerIndex] - preBalances[ownerIndex]) / LAMPORTS;
+
+      // ★ 回退：若原生 SOL 无变化，用 WSOL token 余额净变化（支持 Meteora/Raydium CLMM 等）
+      if (Math.abs(solDelta) < 1e-6 && Math.abs(wsolNetDelta) > 1e-9) {
+        solDelta = -wsolNetDelta; // WSOL 增加 = 买入时用 SOL 换 token（取反对齐方向）
+      }
+
       const isBuy  = tokenDelta > 0 && solDelta < 0;
       const isSell = tokenDelta < 0 && solDelta > 0;
       if (!isBuy && !isSell) continue;
