@@ -467,16 +467,34 @@ function filterValidCandles(candles) {
  * @param {number} klineSec - K线宽度（秒）
  */
 function calcVolumeInfo(rawCandles, windowBars, klineSec) {
-  // ★ 关键：先过滤出实时K线（非历史），再取最近N根
-  // rawCandles 里有大量历史K线(fromHistory=true)，若直接 slice(-8) 会全取到历史K线
+  // ★ 先过滤出实时K线（非历史）
   const liveCandles = rawCandles.filter(c => !c.fromHistory);
-  const lookback = Math.min(liveCandles.length, Math.max(windowBars, 8));
-  const wc = liveCandles.slice(-lookback);
+
+  // 用标准窗口（VOL_WINDOW_SEC 对应的K线根数）
+  // 若标准窗口内无数据，最多往前扩展到8根，但只取最近有数据的那一根
+  // 目的是：K线收盘瞬间不显示空白，用上一根K线的量能过渡
+  const stdLookback = Math.min(liveCandles.length, windowBars);
+  let wc = liveCandles.slice(-stdLookback);
 
   let winBuy = 0, winSell = 0;
   for (const c of wc) {
     winBuy  += (c.buyVolume  || 0);
     winSell += (c.sellVolume || 0);
+  }
+
+  // 若标准窗口内无数据，往前最多找8根，取最近一根有量能的K线
+  if (winBuy + winSell === 0 && liveCandles.length > stdLookback) {
+    const extLookback = Math.min(liveCandles.length, 8);
+    const extCandles = liveCandles.slice(-extLookback);
+    for (let i = extCandles.length - 1; i >= 0; i--) {
+      const c = extCandles[i];
+      if ((c.buyVolume || 0) + (c.sellVolume || 0) > 0) {
+        winBuy  = c.buyVolume  || 0;
+        winSell = c.sellVolume || 0;
+        wc = [c];
+        break;
+      }
+    }
   }
 
   const winTotal = winBuy + winSell;
@@ -487,7 +505,7 @@ function calcVolumeInfo(rawCandles, windowBars, klineSec) {
     buyVol:   winBuy,
     sellVol:  winSell,
     buyRatio: winTotal > 0 ? winBuy / winTotal : 0,
-    windowSec: lookback * klineSec,
+    windowSec: stdLookback * klineSec,
   };
 }
 
