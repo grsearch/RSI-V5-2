@@ -362,16 +362,36 @@ class HeliusTradeStream {
     const preBalances   = meta.preBalances  || [];
     const postBalances  = meta.postBalances || [];
 
-    let accountKeys = [];
-    if (txData && txData.message && txData.message.accountKeys) {
-      accountKeys = txData.message.accountKeys.map(k => typeof k === 'string' ? k : k.pubkey);
-    }
-
+    // ── 1. 计算 token 净变化（所有账户合计）──────────────────────
     const postEntries = postTokenBals.filter(b => b.mint === tokenAddress);
     const preEntries  = preTokenBals.filter(b => b.mint === tokenAddress);
     if (postEntries.length === 0) return null;
 
-    // 预计算 WSOL 净变化（Meteora/Raydium 等）
+    // 取最大单笔 token 变化（通常是用户账户，AMM 池子方向相反）
+    let maxBuyDelta = 0, maxSellDelta = 0;
+    for (const postEntry of postEntries) {
+      const preEntry = preEntries.find(b =>
+        b.accountIndex === postEntry.accountIndex || b.owner === postEntry.owner);
+      const postAmt = parseFloat((postEntry.uiTokenAmount && postEntry.uiTokenAmount.uiAmount) || '0');
+      const preAmt  = preEntry ? parseFloat((preEntry.uiTokenAmount && preEntry.uiTokenAmount.uiAmount) || '0') : 0;
+      const delta = postAmt - preAmt;
+      if (delta > maxBuyDelta)  maxBuyDelta  = delta;
+      if (delta < maxSellDelta) maxSellDelta = delta;
+    }
+
+    // 净 token 变化：买入时用户账户增加（正），卖出时减少（负）
+    const tokenDelta = Math.abs(maxBuyDelta) >= Math.abs(maxSellDelta) ? maxBuyDelta : maxSellDelta;
+    if (Math.abs(tokenDelta) < 1e-9) return null;
+
+    // ── 2. 计算 SOL 净流入/流出 ───────────────────────────────────
+    // 策略1：原生 SOL 余额变化总和（取非程序账户的变化，排除 AMM 池子账户）
+    let nativeSolDelta = 0;
+    for (let i = 0; i < preBalances.length && i < postBalances.length; i++) {
+      nativeSolDelta += postBalances[i] - preBalances[i];
+    }
+    nativeSolDelta /= LAMPORTS;
+
+    // 策略2：WSOL token 余额净变化（Meteora/Raydium CLMM 等）
     let wsolNetDelta = 0;
     const wsolPost = postTokenBals.filter(b => b.mint === WSOL);
     const wsolPre  = preTokenBals.filter(b => b.mint === WSOL);
@@ -382,35 +402,35 @@ class HeliusTradeStream {
       wsolNetDelta += postAmt - preAmt;
     }
 
-    for (const postEntry of postEntries) {
-      const owner = postEntry.owner;
-      if (!owner) continue;
-      const ownerIndex = accountKeys.indexOf(owner);
-      if (ownerIndex < 0 || ownerIndex >= preBalances.length) continue;
+    // ── 3. 判断买卖方向 ───────────────────────────────────────────
+    // token 增加 = 买入（用 SOL 买了 token）
+    // token 减少 = 卖出（卖了 token 换 SOL）
+    const isBuy  = tokenDelta > 0;
+    const isSell = tokenDelta < 0;
 
-      const preEntry = preEntries.find(b => b.accountIndex === postEntry.accountIndex || b.owner === owner);
-      const postAmt = parseFloat((postEntry.uiTokenAmount && postEntry.uiTokenAmount.uiAmount) || '0');
-      const preAmt  = preEntry ? parseFloat((preEntry.uiTokenAmount && preEntry.uiTokenAmount.uiAmount) || '0') : 0;
-      const tokenDelta = postAmt - preAmt;
-      if (Math.abs(tokenDelta) < 1e-12) continue;
-
-      let solDelta = (postBalances[ownerIndex] - preBalances[ownerIndex]) / LAMPORTS;
-      if (Math.abs(solDelta) < 1e-6 && Math.abs(wsolNetDelta) > 1e-9) {
-        solDelta = -wsolNetDelta;
-      }
-
-      const isBuy  = tokenDelta > 0 && solDelta < 0;
-      const isSell = tokenDelta < 0 && solDelta > 0;
-      if (!isBuy && !isSell) continue;
-
-      return {
-        ts: Date.now(), signature, tokenAddress, owner, isBuy,
-        solAmount:   Math.abs(solDelta),
-        tokenAmount: Math.abs(tokenDelta),
-        priceSol:    Math.abs(tokenDelta) > 0 ? Math.abs(solDelta) / Math.abs(tokenDelta) : 0,
-      };
+    // 计算 SOL 金额（取绝对值最大的那个来源）
+    // 买入：SOL 流出（负值），卖出：SOL 流入（正值）
+    let solAmount = 0;
+    if (Math.abs(wsolNetDelta) > Math.abs(nativeSolDelta) * 0.5 + 1e-6) {
+      // WSOL 变化更显著（Meteora 等）
+      solAmount = Math.abs(wsolNetDelta);
+    } else if (Math.abs(nativeSolDelta) > 1e-6) {
+      // 原生 SOL 变化（Pump AMM 等）
+      solAmount = Math.abs(nativeSolDelta);
+    } else {
+      // 两者都很小，仍记录交易但 SOL 金额为 0（不影响方向判断）
+      solAmount = 0;
     }
-    return null;
+
+    const absTokenDelta = Math.abs(tokenDelta);
+    return {
+      ts: Date.now(), signature, tokenAddress,
+      owner: postEntries[0]?.owner || '',
+      isBuy,
+      solAmount,
+      tokenAmount: absTokenDelta,
+      priceSol: absTokenDelta > 0 ? solAmount / absTokenDelta : 0,
+    };
   }
 
   isConnected() { return this._connected; }
