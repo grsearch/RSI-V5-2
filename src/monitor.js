@@ -450,12 +450,22 @@ class TokenMonitor extends EventEmitter {
       }
     }
 
-    logger.debug('[HeliusTrade] %s %s %.4f SOL @ %.10f (%s)',
-      state.symbol,
-      trade.isBuy ? 'BUY' : 'SELL',
-      trade.solAmount,
-      trade.priceSol,
-      trade.signature?.slice(0, 12) || '?');
+    // 大额交易记 info 日志（方便人工核对和 GMGN 对账）
+    if (trade.solAmount >= 1.0) {
+      logger.info('[HeliusTrade] %s %s %.3f SOL @ %.10f (%s)',
+        state.symbol,
+        trade.isBuy ? 'BUY' : 'SELL',
+        trade.solAmount,
+        trade.priceSol,
+        trade.signature?.slice(0, 16) || '?');
+    } else {
+      logger.debug('[HeliusTrade] %s %s %.4f SOL @ %.10f (%s)',
+        state.symbol,
+        trade.isBuy ? 'BUY' : 'SELL',
+        trade.solAmount,
+        trade.priceSol,
+        trade.signature?.slice(0, 12) || '?');
+    }
   }
 
   // ── 紧急止损价格刷新（链上检测到大额卖出时触发）────────────

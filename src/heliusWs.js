@@ -16,8 +16,10 @@ const HELIUS_GATEKEEPER_URL = process.env.HELIUS_GATEKEEPER_URL || '';
 const HELIUS_API_KEY        = process.env.HELIUS_API_KEY || '';
 const HELIUS_RPC_URL        = process.env.HELIUS_RPC_URL || '';
 
-// 超过此数量时改用批量订阅
-const BATCH_THRESHOLD = parseInt(process.env.HELIUS_BATCH_THRESHOLD || '30', 10);
+// 超过此数量时改用批量订阅。★ 默认 0 = 永远用批量订阅
+// Helius 单 WebSocket 连接对 transactionSubscribe 有订阅槽位隐式限制(~50)
+// 独立订阅每个币占一槽，数量多会导致确认超慢甚至丢失，批量订阅合并后只占少量槽
+const BATCH_THRESHOLD = parseInt(process.env.HELIUS_BATCH_THRESHOLD || '0', 10);
 
 const LAMPORTS     = 1e9;
 const PING_MS      = 25000;
@@ -57,7 +59,7 @@ class HeliusTradeStream {
     this._batchSubId    = null;
     this._batchDebounce    = null;
     this._batchTimeoutTimer = null;
-    this._CHUNK_SIZE        = 50;
+    this._CHUNK_SIZE        = parseInt(process.env.HELIUS_CHUNK_SIZE || '50', 10);
     this._stats = { txReceived: 0, txMatched: 0, txParsed: 0, txSkipped: 0, connType: 'none' };
   }
 
@@ -136,17 +138,9 @@ class HeliusTradeStream {
     if (this._tokens.size === 0) return;
     for (const info of this._tokens.values()) info.subId = null;
 
-    if (this._tokens.size > BATCH_THRESHOLD) {
-      setTimeout(() => this._subscribeBatch(), 1000);
-    } else {
-      let i = 0;
-      for (const [address] of this._tokens.entries()) {
-        setTimeout(() => {
-          if (this._tokens.has(address) && this._connected) this._subscribeToken(address);
-        }, i * 150);
-        i++;
-      }
-    }
+    // ★ FIX: 重连后统一走批量订阅，不再按 BATCH_THRESHOLD 判断
+    //   因为独立订阅会撞 Helius 单连接订阅槽位限制(~50)
+    setTimeout(() => this._subscribeBatch(), 500);
   }
 
   _subscribeToken(tokenAddress) {
@@ -183,70 +177,124 @@ class HeliusTradeStream {
     const addresses = Array.from(this._tokens.keys());
     if (addresses.length === 0) return;
 
-    // 取消所有旧的批量订阅
-    for (const oldSubId of this._batchSubIds) {
-      this._ws.send(JSON.stringify({
-        jsonrpc: '2.0', id: this._nextRpcId++,
-        method: 'transactionUnsubscribe',
-        params: [oldSubId],
-      }));
+    // ★ FIX: 保存旧订阅,等新订阅确认后再取消,避免订阅空窗期丢交易
+    const oldBatchSubIds = this._batchSubIds.slice();
+    const oldTokenSubs = [];
+    for (const [addr, info] of this._tokens.entries()) {
+      if (info.subId) oldTokenSubs.push({ addr, subId: info.subId });
     }
+
+    // 先重置当前激活订阅记录（旧的作为"待取消"保存）
     this._batchSubIds = [];
     this._batchSubId  = null;
 
-    // 取消所有独立订阅
-    for (const info of this._tokens.values()) {
-      if (info.subId) {
-        this._ws.send(JSON.stringify({
-          jsonrpc: '2.0', id: this._nextRpcId++,
-          method: 'transactionUnsubscribe',
-          params: [info.subId],
-        }));
-        info.subId = null;
-      }
-    }
-
-    // 分块发送批量订阅（每块最多 CHUNK_SIZE 个地址）
+    // 分块
     const chunks = [];
     for (let i = 0; i < addresses.length; i += this._CHUNK_SIZE) {
       chunks.push(addresses.slice(i, i + this._CHUNK_SIZE));
     }
 
-    logger.info(`[HeliusWS] 📡 批量订阅 ${addresses.length} 个 token，分 ${chunks.length} 块`);
+    logger.info(`[HeliusWS] 📡 批量订阅 ${addresses.length} 个 token，分 ${chunks.length} 块 (每块 ${this._CHUNK_SIZE})` +
+      (oldBatchSubIds.length > 0 ? ` [旧订阅 ${oldBatchSubIds.length} 块待切换]` : ''));
 
+    this._pendingBatchChunks = new Map(); // rpcId → { chunk, retry, sentAt, idx }
+
+    // ★ FIX: 先发送新订阅
     chunks.forEach((chunk, idx) => {
-      const rpcId = this._nextRpcId++;
-      this._pendingSubs.set(rpcId, `__batch_${idx}__`);
-      this._ws.send(JSON.stringify({
-        jsonrpc: '2.0', id: rpcId,
-        method: 'transactionSubscribe',
-        params: [
-          { accountInclude: chunk, failed: false },
-          { commitment: 'confirmed', encoding: 'jsonParsed', transactionDetails: 'full', maxSupportedTransactionVersion: 0 },
-        ],
-      }));
-      logger.info(`[HeliusWS] 📡 块[${idx+1}/${chunks.length}] ${chunk.length} 个 token rpcId=${rpcId}`);
+      setTimeout(() => {
+        if (!this._connected || this._ws.readyState !== WebSocket.OPEN) return;
+        this._sendBatchChunk(chunk, idx, 0);
+      }, idx * 200);
     });
 
-    // ★ 超时降级：若5秒内未收到任何批量订阅确认，自动回退到独立订阅
+    // ★ FIX: 延迟取消旧订阅 —— 等新订阅有机会确认
+    //   策略：至少等 3 秒 + 最后一块发送时间，确保大部分新块已确认
+    const cancelDelay = 3000 + chunks.length * 200;
+    if (oldBatchSubIds.length > 0 || oldTokenSubs.length > 0) {
+      setTimeout(() => {
+        if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
+        for (const oldSubId of oldBatchSubIds) {
+          this._ws.send(JSON.stringify({
+            jsonrpc: '2.0', id: this._nextRpcId++,
+            method: 'transactionUnsubscribe',
+            params: [oldSubId],
+          }));
+        }
+        for (const o of oldTokenSubs) {
+          this._ws.send(JSON.stringify({
+            jsonrpc: '2.0', id: this._nextRpcId++,
+            method: 'transactionUnsubscribe',
+            params: [o.subId],
+          }));
+        }
+        logger.info(`[HeliusWS] 🔕 旧订阅已取消 (batch=${oldBatchSubIds.length}, individual=${oldTokenSubs.length})`);
+      }, cancelDelay);
+    }
+
+    // 超时降级检测
     clearTimeout(this._batchTimeoutTimer);
     this._batchTimeoutTimer = setTimeout(() => {
-      if (this._batchSubIds.length === 0 && this._connected) {
-        logger.warn('[HeliusWS] ⚠️ 批量订阅5秒内未确认，降级到独立订阅模式');
-        this._fallbackToIndividual();
+      const unconfirmed = [];
+      for (const [, info] of this._pendingBatchChunks || []) {
+        for (const addr of info.chunk) unconfirmed.push(addr);
       }
-    }, 5000);
+      if (unconfirmed.length > 0 && this._batchSubIds.length === 0 && this._connected) {
+        logger.warn(`[HeliusWS] ⚠️ 批量订阅 15s 内无任何确认，降级到独立订阅`);
+        this._fallbackToIndividual();
+      } else if (unconfirmed.length > 0) {
+        logger.warn(`[HeliusWS] ⚠️ 部分块未确认 (${unconfirmed.length} 个 token)，重试中`);
+      }
+    }, 15000);
+  }
+
+  // ★ FIX: 发送单个块 + 自动重试
+  _sendBatchChunk(chunk, idx, retry) {
+    if (!this._connected || !this._ws || this._ws.readyState !== WebSocket.OPEN) return;
+    const rpcId = this._nextRpcId++;
+    this._pendingSubs.set(rpcId, `__batch_${idx}_${retry}__`);
+    if (!this._pendingBatchChunks) this._pendingBatchChunks = new Map();
+    this._pendingBatchChunks.set(rpcId, { chunk, retry, sentAt: Date.now(), idx });
+
+    this._ws.send(JSON.stringify({
+      jsonrpc: '2.0', id: rpcId,
+      method: 'transactionSubscribe',
+      params: [
+        { accountInclude: chunk, failed: false },
+        { commitment: 'confirmed', encoding: 'jsonParsed', transactionDetails: 'full', maxSupportedTransactionVersion: 0 },
+      ],
+    }));
+    logger.info(`[HeliusWS] 📡 块[${idx}] ${chunk.length} token rpcId=${rpcId} retry=${retry}`);
+
+    // 单块 10 秒未确认就重试，最多 3 次
+    setTimeout(() => {
+      if (this._pendingBatchChunks && this._pendingBatchChunks.has(rpcId)) {
+        this._pendingBatchChunks.delete(rpcId);
+        this._pendingSubs.delete(rpcId);
+        if (retry < 3 && this._connected) {
+          logger.warn(`[HeliusWS] ⏱ 块[${idx}] rpcId=${rpcId} 超时未确认，重试 ${retry+1}/3`);
+          this._sendBatchChunk(chunk, idx, retry + 1);
+        } else if (retry >= 3) {
+          logger.error(`[HeliusWS] ❌ 块[${idx}] 重试3次仍失败，包含 ${chunk.length} 个 token`);
+        }
+      }
+    }, 10000);
   }
 
   _fallbackToIndividual() {
+    // ★ FIX: 独立订阅作为兜底方案，间隔改为 300ms(避免触发 Helius 限流)
+    //   并检查是否已经有 subId，跳过已订阅的
     let i = 0;
-    for (const [addr] of this._tokens.entries()) {
+    for (const [addr, info] of this._tokens.entries()) {
+      if (info.subId) continue; // 已订阅跳过
       setTimeout(() => {
-        if (this._tokens.has(addr) && this._connected) this._subscribeToken(addr);
-      }, i * 100);
+        if (this._tokens.has(addr) && this._connected) {
+          const cur = this._tokens.get(addr);
+          if (cur && !cur.subId) this._subscribeToken(addr);
+        }
+      }, i * 300);
       i++;
     }
-    logger.info(`[HeliusWS] 🔄 降级独立订阅 ${this._tokens.size} 个 token`);
+    logger.info(`[HeliusWS] 🔄 降级独立订阅 ${i} 个 token (间隔300ms)`);
   }
 
   subscribe(tokenAddress, symbol, onTrade) {
@@ -254,15 +302,26 @@ class HeliusTradeStream {
     const count = this._tokens.size;
 
     if (this._connected) {
-      if (count > BATCH_THRESHOLD) {
-        clearTimeout(this._batchDebounce);
+      // ★ FIX: 不再区分"是否达到 BATCH_THRESHOLD",统一走批量订阅
+      //   原因：Helius 单 WS 连接对 transactionSubscribe 订阅槽位有隐式限制(~50个)
+      //         独立订阅每个币占一个槽位，49个币就可能打满。
+      //         批量订阅用一次 transactionSubscribe 把多个 accountInclude 合并，
+      //         只占用 1~几个槽位，可以稳定监控数百个币。
+      //
+      // ★ FIX: 防抖改为"排队合并"而非"重置计时器"，避免币陆续加入导致永远不触发
+      this._pendingSubAdditions = this._pendingSubAdditions || new Set();
+      this._pendingSubAdditions.add(tokenAddress);
+
+      if (!this._batchDebounce) {
         this._batchDebounce = setTimeout(() => {
-          if (this._connected) this._subscribeBatch();
-        }, 3000);
-      } else {
-        setTimeout(() => {
-          if (this._tokens.has(tokenAddress) && this._connected) this._subscribeToken(tokenAddress);
-        }, 50);
+          this._batchDebounce = null;
+          const addedCount = (this._pendingSubAdditions && this._pendingSubAdditions.size) || 0;
+          this._pendingSubAdditions = null;
+          if (this._connected) {
+            logger.info(`[HeliusWS] 📦 批量订阅触发 (新增 ${addedCount} 个，总 ${this._tokens.size})`);
+            this._subscribeBatch();
+          }
+        }, 5000);  // ★ FIX: 5秒聚合，适合 95+ 币场景陆续加入/退出时减少重订阅风暴
       }
     }
     logger.info(`[HeliusWS] 📌 注册 ${symbol}，当前监控 ${count} 个`);
@@ -272,11 +331,18 @@ class HeliusTradeStream {
     if (!this._batchSubId) this._unsubscribeToken(tokenAddress);
     this._tokens.delete(tokenAddress);
 
+    // ★ FIX: 使用批量订阅模式时，删除后需要重建订阅（新的 accountInclude 列表）
+    //   同样改为"不重置计时器"的排队模式
     if (this._batchSubId && this._connected) {
-      clearTimeout(this._batchDebounce);
-      this._batchDebounce = setTimeout(() => {
-        if (this._connected) this._subscribeBatch();
-      }, 1000);
+      if (!this._batchDebounce) {
+        this._batchDebounce = setTimeout(() => {
+          this._batchDebounce = null;
+          if (this._connected) {
+            logger.info(`[HeliusWS] 📦 代币移除触发重订阅 (当前 ${this._tokens.size} 个)`);
+            this._subscribeBatch();
+          }
+        }, 5000);  // ★ FIX: 5秒聚合,与 subscribe 一致
+      }
     }
     logger.info(`[HeliusWS] 🔕 移除 ${tokenAddress.slice(0,8)}，剩余 ${this._tokens.size} 个`);
   }
@@ -291,21 +357,18 @@ class HeliusTradeStream {
       this._pendingSubs.delete(msg.id);
 
       if (key.startsWith('__batch_')) {
+        // ★ FIX: 清理 pendingBatchChunks 跟踪(收到确认,取消重试计时)
+        if (this._pendingBatchChunks) this._pendingBatchChunks.delete(msg.id);
+
         if (typeof msg.result === 'number') {
           this._batchSubIds.push(msg.result);
           if (!this._batchSubId) this._batchSubId = msg.result;
           clearTimeout(this._batchTimeoutTimer); // 收到确认，取消降级计时
           logger.info(`[HeliusWS] ✅ 批量订阅块确认 subId=${msg.result} (共 ${this._batchSubIds.length} 块)`);
         } else {
-          logger.warn(`[HeliusWS] ❌ 批量订阅块失败: ${JSON.stringify(msg).slice(0,200)}`);
-          // 降级：逐个独立订阅
-          let i = 0;
-          for (const [addr] of this._tokens.entries()) {
-            setTimeout(() => {
-              if (this._tokens.has(addr) && this._connected) this._subscribeToken(addr);
-            }, i * 100);
-            i++;
-          }
+          logger.warn(`[HeliusWS] ❌ 批量订阅块失败 rpcId=${msg.id}: ${JSON.stringify(msg).slice(0,200)}`);
+          // ★ FIX: 批量订阅失败不再直接降级到独立订阅(独立订阅也会撞订阅槽位限制)
+          //   改为：等待其他块确认，或靠 _sendBatchChunk 的超时重试处理
         }
       } else {
         const info = this._tokens.get(key);
@@ -362,9 +425,21 @@ class HeliusTradeStream {
     const preBalances   = meta.preBalances  || [];
     const postBalances  = meta.postBalances || [];
 
-    // ── 1. 找到"用户账户"的 token 净变化 ─────────────────────────
-    //   AMM swap 的本质：一方(用户)的 token 余额变化 = 另一方(池子)变化的反数
-    //   取用户侧(usually 非 pool、非 mint authority)的变化作为成交量基准
+    // ── 获取交易签名者(fee payer = 用户钱包) ────────────────────
+    // Solana 交易的 message.accountKeys[0] 就是签名者 (feePayer)
+    let signer = null;
+    try {
+      const msg = txData && txData.message;
+      if (msg) {
+        // 两种可能格式：accountKeys 数组（字符串）或对象数组（jsonParsed）
+        const keys = msg.accountKeys || [];
+        const first = keys[0];
+        if (typeof first === 'string') signer = first;
+        else if (first && first.pubkey) signer = first.pubkey;
+      }
+    } catch (_) {}
+
+    // ── 1. 找到目标 token 的所有账户变化 ─────────────────────────
     const postEntries = postTokenBals.filter(b => b.mint === tokenAddress);
     const preEntries  = preTokenBals.filter(b => b.mint === tokenAddress);
     if (postEntries.length === 0) return null;
@@ -378,98 +453,152 @@ class HeliusTradeStream {
       const preAmt  = preEntry ? parseFloat((preEntry.uiTokenAmount && preEntry.uiTokenAmount.uiAmount) || '0') : 0;
       const delta = postAmt - preAmt;
       if (Math.abs(delta) > 1e-9) {
-        tokenDeltas.push({ delta, owner: postEntry.owner, accountIndex: postEntry.accountIndex });
+        tokenDeltas.push({
+          delta,
+          owner: postEntry.owner,
+          accountIndex: postEntry.accountIndex,
+          isSigner: postEntry.owner === signer,  // ★ 是否是签名者账户
+        });
+      }
+    }
+    // ★ 处理 pre 有 post 无的情况（账户被关闭）
+    for (const preEntry of preEntries) {
+      const found = postEntries.find(b =>
+        b.accountIndex === preEntry.accountIndex || b.owner === preEntry.owner);
+      if (!found) {
+        const preAmt = parseFloat((preEntry.uiTokenAmount && preEntry.uiTokenAmount.uiAmount) || '0');
+        if (preAmt > 1e-9) {
+          tokenDeltas.push({
+            delta: -preAmt,
+            owner: preEntry.owner,
+            accountIndex: preEntry.accountIndex,
+            isSigner: preEntry.owner === signer,
+          });
+        }
       }
     }
     if (tokenDeltas.length === 0) return null;
 
-    // ★ FIX: 正负 delta 应该大致相等（一方给，一方收），取绝对值最大者作为"用户侧"
-    //   注意：多跳 swap 会产生多个 pool 账户变化，但单笔交易的用户净变化仍是唯一的
-    //   正确口径是"所有正 delta 之和 与 所有负 delta 之和，取绝对值较小的那个"
-    //   （较大的那个会因为路由过程中的临时累加而虚高）
-    let sumPositive = 0, sumNegative = 0;
-    for (const d of tokenDeltas) {
-      if (d.delta > 0) sumPositive += d.delta;
-      else sumNegative += d.delta;
+    // ── 2. 方向判断：优先用签名者账户的 delta ────────────────────
+    //   AMM swap 里，签名者账户的 token delta 正负 = 买/卖方向
+    //   买入: 用户 token +X, pool token -X → 签名者 delta > 0
+    //   卖出: 用户 token -X, pool token +X → 签名者 delta < 0
+    let userDelta = null;
+    const signerDeltas = tokenDeltas.filter(d => d.isSigner);
+    if (signerDeltas.length > 0) {
+      // 签名者账户可能有多个（ATA + 直接账户），取净变化
+      userDelta = signerDeltas.reduce((s, d) => s + d.delta, 0);
     }
-    // 成交 token 量 = min(|正变化总和|, |负变化总和|)
-    //   理想情况两者相等；若不等(手续费、转账)，取较小者避免虚高
-    const absTokenDelta = Math.min(Math.abs(sumPositive), Math.abs(sumNegative));
-    if (absTokenDelta < 1e-9) return null;
+    // 兜底：如果拿不到签名者（txData 结构异常），用 min(|sumPos|, |sumNeg|) 的方向
+    //   此时方向可能错，但至少成交量正确
+    if (userDelta === null || Math.abs(userDelta) < 1e-9) {
+      // 最坏情况：没法可靠判断方向，看正负变化总和的平衡
+      let sumPositive = 0, sumNegative = 0;
+      for (const d of tokenDeltas) {
+        if (d.delta > 0) sumPositive += d.delta;
+        else sumNegative += d.delta;
+      }
+      // 规则：net = sumPos + sumNeg
+      //   net 明显 > 0 → 用户净收到 token（买入）
+      //   net 明显 < 0 → 用户净付出 token（卖出）
+      //   |net| 接近 0 → swap 平衡，无法判断，跳过这笔
+      const net = sumPositive + sumNegative;
+      const total = sumPositive - sumNegative; // |sumPos|+|sumNeg|
+      if (Math.abs(net) / total < 0.01) {
+        // 纯 swap 找不到净方向，跳过
+        return null;
+      }
+      userDelta = net;
+    }
 
-    // 买卖方向：用户侧变化为正 = 买入；用户侧一般是绝对值最大的那个账户（非 pool）
-    // 简化：绝对值最大的 delta 的符号代表用户侧方向
-    let userDelta = tokenDeltas[0].delta;
-    for (const d of tokenDeltas) {
-      if (Math.abs(d.delta) > Math.abs(userDelta)) userDelta = d.delta;
-    }
     const isBuy = userDelta > 0;
+    const absTokenDelta = Math.abs(userDelta);
 
-    // ── 2. 计算 SOL 金额（两条策略取其中"真实成交"的那个）───────
-    //
-    //   ★ 关键修复：原版用 Math.abs 累加所有 WSOL 账户变化，会把 1 SOL 成交
-    //     算成 2 SOL(用户-1、pool+1 两边都 abs) 甚至更多(多跳路由累加)
-    //
-    //   正确口径：用户侧 SOL 变化 = 成交额
-    //     native SOL: 单账户最大变化（Pump AMM 用户直接转 SOL）
-    //     WSOL:       取所有 WSOL 账户正/负 delta 之和的较小绝对值
-    //                 （和 token 同理：一方给一方收，min 才是真实成交额）
+    // ── 3. SOL 金额：优先用签名者的 SOL/WSOL 变化 ────────────────
+    //   签名者账户的 native SOL 或 WSOL ATA 的变化 = 用户付/收的 SOL
 
-    // native SOL：扣掉 tip/fee 的影响，只看大额账户
-    // 我们只关心"可能是用户"的变化，通常用户账户 SOL 变化 >= 0.0001 SOL 才算有效
-    //   tip 账户(Jito MEV)一般 < 0.01 SOL，priority fee 通常 < 0.001 SOL
-    //   取"第二大"而不是最大能更稳，但简化起见用最大且设下限
-    const MIN_SOL_DELTA = 0.0001;
-    let nativeSolDelta = 0;
-    for (let i = 0; i < preBalances.length && i < postBalances.length; i++) {
-      const delta = Math.abs(postBalances[i] - preBalances[i]) / LAMPORTS;
-      if (delta > MIN_SOL_DELTA && delta > nativeSolDelta) nativeSolDelta = delta;
+    // 先找签名者账户的 index（用于 preBalances/postBalances 查找 native SOL）
+    let signerIdx = -1;
+    try {
+      const keys = (txData && txData.message && txData.message.accountKeys) || [];
+      for (let i = 0; i < keys.length; i++) {
+        const k = keys[i];
+        const pk = typeof k === 'string' ? k : (k && k.pubkey);
+        if (pk === signer) { signerIdx = i; break; }
+      }
+    } catch (_) {}
+
+    // 签名者 native SOL 变化（扣除手续费影响）
+    let signerNativeDelta = 0;
+    if (signerIdx >= 0 && signerIdx < preBalances.length && signerIdx < postBalances.length) {
+      signerNativeDelta = Math.abs(postBalances[signerIdx] - preBalances[signerIdx]) / LAMPORTS;
+      // 扣掉 priority fee 和 base fee 的影响（通常 < 0.01 SOL）
+      // meta.fee 是实际手续费(lamports)
+      const feeSol = (meta.fee || 5000) / LAMPORTS;
+      signerNativeDelta = Math.max(0, signerNativeDelta - feeSol);
     }
 
-    // WSOL: 正/负两侧分别求和，取较小绝对值
-    let wsolSumPos = 0, wsolSumNeg = 0;
-    const wsolPost = postTokenBals.filter(b => b.mint === WSOL);
-    const wsolPre  = preTokenBals.filter(b => b.mint === WSOL);
-    for (const wp of wsolPost) {
-      const wr = wsolPre.find(b => b.accountIndex === wp.accountIndex || b.owner === wp.owner);
+    // 签名者的 WSOL ATA 变化
+    let signerWsolDelta = 0;
+    const signerWsolPost = postTokenBals.filter(b => b.mint === WSOL && b.owner === signer);
+    const signerWsolPre  = preTokenBals.filter(b => b.mint === WSOL && b.owner === signer);
+    for (const wp of signerWsolPost) {
+      const wr = signerWsolPre.find(b => b.accountIndex === wp.accountIndex);
       const postAmt = parseFloat((wp.uiTokenAmount && wp.uiTokenAmount.uiAmount) || '0');
       const preAmt  = wr ? parseFloat((wr.uiTokenAmount && wr.uiTokenAmount.uiAmount) || '0') : 0;
-      const d = postAmt - preAmt;
-      if (d > 0) wsolSumPos += d;
-      else wsolSumNeg += d;
+      signerWsolDelta += Math.abs(postAmt - preAmt);
     }
-    // 处理 pre 里有但 post 里没了的 WSOL 账户（WSOL 账户被关闭 sync）
-    for (const wr of wsolPre) {
-      const found = wsolPost.find(b => b.accountIndex === wr.accountIndex || b.owner === wr.owner);
+    // WSOL 账户可能被关闭（wrap/unwrap）
+    for (const wr of signerWsolPre) {
+      const found = signerWsolPost.find(b => b.accountIndex === wr.accountIndex);
       if (!found) {
         const preAmt = parseFloat((wr.uiTokenAmount && wr.uiTokenAmount.uiAmount) || '0');
-        if (preAmt > 0) wsolSumNeg -= preAmt;  // 账户被关，等同于 -preAmt
+        if (preAmt > 1e-9) signerWsolDelta += preAmt;
       }
     }
-    const wsolNetDelta = Math.min(Math.abs(wsolSumPos), Math.abs(wsolSumNeg));
 
-    // ── 3. 最终 solAmount：两条策略取其中"看起来合理"的那个 ─────
-    //   策略选择逻辑：
-    //   - Pump AMM 直接用 native SOL → nativeSolDelta 大、wsolNetDelta 为 0
-    //   - Raydium/Meteora 用 WSOL   → wsolNetDelta 大、nativeSolDelta 只是 fee
-    //   - 套利/MEV 混合              → 两者都有，取较小者更接近真实用户成交额
-    //   取两者中有效且较小的那一个（>MIN_SOL_DELTA 才算有效）
-    let solAmount = 0;
-    const candidates = [nativeSolDelta, wsolNetDelta].filter(v => v > MIN_SOL_DELTA);
-    if (candidates.length === 2) {
-      // 两条策略都有数据：取较小者（避免策略相加导致翻倍）
-      //   但如果较小的明显太小（< 较大的 10%）说明它是 fee，用较大者
-      const [a, b] = candidates.sort((x, y) => x - y);
-      solAmount = (a / b < 0.1) ? b : a;
-    } else if (candidates.length === 1) {
-      solAmount = candidates[0];
+    // 合计签名者的 SOL 流动（WSOL + native,两者互补,加起来才是总 SOL 流动）
+    //   - Pump AMM: 用户直接付 native SOL → signerNativeDelta
+    //   - Raydium:  用户先 wrap SOL → WSOL → swap → signerWsolDelta
+    //   - 有些钱包:先从 WSOL ATA 拿 WSOL，不足时 wrap → 两者都有
+    let solAmount = signerNativeDelta + signerWsolDelta;
+
+    // ── 4. 如果签名者路径失败(solAmount ≈ 0),用 pool 侧的 SOL 流动做兜底 ──
+    //   pool 侧的 SOL 流动和用户侧相反但数值相等（忽略 fee）
+    const MIN_SOL_DELTA = 0.0001;
+    if (solAmount < MIN_SOL_DELTA) {
+      // 找 pool 账户的 WSOL 变化（排除 signer）
+      let poolWsolSum = 0;
+      for (const wp of postTokenBals.filter(b => b.mint === WSOL && b.owner !== signer)) {
+        const wr = preTokenBals.find(b => b.mint === WSOL && (b.accountIndex === wp.accountIndex || b.owner === wp.owner));
+        const postAmt = parseFloat((wp.uiTokenAmount && wp.uiTokenAmount.uiAmount) || '0');
+        const preAmt  = wr ? parseFloat((wr.uiTokenAmount && wr.uiTokenAmount.uiAmount) || '0') : 0;
+        poolWsolSum += Math.abs(postAmt - preAmt);
+      }
+      // pool 侧可能有多个变化（多跳路由），取最大的单账户变化作为真实成交
+      // 但简化起见先用 sum 的一半（近似一来一回）
+      if (poolWsolSum > MIN_SOL_DELTA) solAmount = poolWsolSum / 2;
     }
 
-    if (solAmount <= 0) return null;
+    if (solAmount < MIN_SOL_DELTA) return null;
+
+    // ── 5. 过滤异常交易 ─────────────────────────────────────────
+    //   多跳路由里本 token 只是中间品，signer 实际付的是另一个 token 而非 SOL
+    //   此时 solAmount 虽然有值，但不该计入这个 token 的交易量
+    //   判断：如果签名者的 WSOL/native 变化为 0，且交易涉及 2+ 非 WSOL token，跳过
+    const nonWsolMintsInvolved = new Set(
+      postTokenBals
+        .filter(b => b.mint && b.mint !== WSOL && b.owner === signer)
+        .map(b => b.mint)
+    );
+    if (signerNativeDelta < MIN_SOL_DELTA && signerWsolDelta < MIN_SOL_DELTA && nonWsolMintsInvolved.size > 1) {
+      // 签名者在做 token A → token B 的直接兑换，本 token 可能只是中间步骤
+      return null;
+    }
 
     return {
       ts: Date.now(), signature, tokenAddress,
-      owner: postEntries[0]?.owner || '',
+      owner: signer || '',
       isBuy,
       solAmount,
       tokenAmount: absTokenDelta,
@@ -483,14 +612,21 @@ class HeliusTradeStream {
   getStats() {
     let confirmedSubs = 0;
     for (const info of this._tokens.values()) { if (info.subId) confirmedSubs++; }
+    // ★ FIX: 精确的已订阅币数量
+    //   - 批量模式: 所有 batchSubIds 对应的块都覆盖到就是 tokens.size
+    //   - 独立模式: subId 非 null 的数量
+    const inBatchMode = this._batchSubIds.length > 0;
+    const pendingBatchChunks = (this._pendingBatchChunks && this._pendingBatchChunks.size) || 0;
     return {
       connected:     this._connected,
       connType:      this._connType,
-      subMode:       this._batchSubId ? 'batch' : 'token',
+      subMode:       inBatchMode ? 'batch' : (confirmedSubs > 0 ? 'token' : 'none'),
       tokens:        this._tokens.size,
-      confirmedSubs: this._batchSubId ? this._tokens.size : confirmedSubs,
+      confirmedSubs: inBatchMode ? this._tokens.size : confirmedSubs,
       batchSubId:    this._batchSubId || null,
-      batchActive:   this._batchSubIds.length > 0,
+      batchSubIds:   this._batchSubIds.length,
+      batchActive:   inBatchMode,
+      pendingBatchChunks,   // 还在等确认的批量块数
       retryCount:    this._retryCount,
       ...this._stats,
     };

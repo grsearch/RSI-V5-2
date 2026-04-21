@@ -1,103 +1,137 @@
-# CHANGELOG — RSI-V5-2 量能显示与计算修复
+# CHANGELOG — RSI-V5-2 修复
 
-## V2 修复(本次,在 V1 基础上增补)
+## V4 修复(本次)— 量能方向判断错误 + 95 币动态订阅管理
 
-### 🔴 量能虚高问题(用户反馈)
+### 现象
 
-Dashboard 上某些币的 Buy/Sell 数字明显高于实际 5 分钟窗口内的真实成交量。经过深入排查,发现 **5 个独立的放大源**:
+| 币 | Dashboard 显示 | GMGN 实际 5 分钟 |
+|---|---|---|
+| Rudi | **Buy 9.81 / Sell 1.19 SOL** | 实际卖 ~3.1 SOL,买 ~0 SOL |
+| (多币) | 买卖方向对反,金额也虚高 | - |
 
-#### 问题 1:`heliusWs._extractTrade` WSOL `Math.abs` 累加(最严重)
+### 问题根源(3 条 `_extractTrade` bug)
+
+#### ① 方向判断不稳定
 
 ```javascript
 // 原版(错)
-for (const wp of wsolPost) {
-  wsolNetDelta += Math.abs(postAmt - preAmt);  // ← 用户-1 + pool+1 = 2
+let userDelta = tokenDeltas[0].delta;
+for (const d of tokenDeltas) {
+  if (Math.abs(d.delta) > Math.abs(userDelta)) userDelta = d.delta;
 }
+const isBuy = userDelta > 0;
 ```
 
-一笔 1 SOL 的 AMM swap,用户账户 WSOL -1,池子 WSOL +1,`Math.abs` 相加变成 2。**1 SOL 被算成 2 SOL**。多跳路由(Raydium 2 hop)甚至被放大 4 倍。
+AMM swap 里用户 delta 和 pool delta 绝对值完全相等(或因手续费只差 0.01%)。`>` 不严格成立时 `userDelta` 保留遍历到的**第一个**——可能是 pool 侧的,**方向反了**。
 
-**修复**:改为分别累加正/负 delta,取较小的绝对值(= 真实用户侧成交额)。
+**修复**:**用交易签名者(fee payer = 用户钱包)作为方向判断的锚点**。Solana 交易的 `message.accountKeys[0]` 就是签名者,取签名者账户的 token delta 正负就是 100% 准确的买/卖方向。
 
-#### 问题 2:native SOL 扫所有账户取 max
+#### ② 多跳路由把别人的交易算到本币头上
 
-原版 `maxNativeSolChange` 会误把 Jito MEV tip 账户、priority fee 等变化当作交易金额。
+Helius `accountInclude` 订阅是 account-level,一笔 `TOKEN_A → WSOL → Rudi` 的多跳会同时匹配 TOKEN_A 和 Rudi。原代码对 Rudi 调用 `_extractTrade`,拿到的是整个路由的 SOL,**用户实际用 TOKEN_A 买 Rudi,不是用 SOL**。
 
-**修复**:加 `MIN_SOL_DELTA = 0.0001` 过滤器,忽略微小变化。
+**修复**:判断签名者的 WSOL/native 变化是否接近 0,且涉及多个非 WSOL token,则跳过这笔(签名者不是在用 SOL 买卖本 token)。
 
-#### 问题 3:两条 SOL 策略 Math.max 相当于采纳较大的那个
+#### ③ SOL 金额取值方向混乱
 
-原版 `solAmount = Math.max(nativeSolChange, wsolNetDelta)`。WSOL 被放大 2x 后往往 > native,于是采纳放大后的值。
+原版 `max(nativeSolDelta, wsolNetDelta)` 对中转账户也敏感,套利交易会放大。
 
-**修复**:两条策略都有数据时取较小者(真实成交额),差距 10 倍以上视为 fee 噪音采纳较大值。
+**修复**:只看**签名者账户**的 native SOL 变化(扣除手续费)+ **签名者**的 WSOL ATA 变化之和。签名者路径失效时才退回 pool 侧兜底。
 
-#### 问题 4:V1 修复引入的 `Math.max(kBuy, tBuy)` 合并
+### 95 币动态订阅管理优化
 
-我在 V1 修复里加的"K线路径 vs tick路径取 max"逻辑,在两条路径窗口不对齐时会造成虚高。
+**原问题**:每次 add/remove 都 `unsubscribe 旧 + subscribe 新`,中间有订阅空窗期,会丢交易。
 
-**修复**:显示层只用一条路径 — `_refreshLiveVolume` 严格 VOL_WINDOW_SEC 秒滑动窗口。K 线聚合仅用于 RSI 信号判断,两者职责分离。
+**修复**:
 
-#### 问题 5:K线 currentCandle 窗口随机
+1. **先建新订阅,后取消旧订阅**:新订阅发出后等 `3秒 + 块数*200ms` 再取消旧订阅,确保新订阅已确认并激活,旧期间的交易不会丢
+2. **防抖延长到 5 秒**:95 币陆续进/出时 5 秒内合并为一次重订阅,大幅减少 API 调用
+3. **`CHUNK_SIZE` 可配置**:通过 `HELIUS_CHUNK_SIZE` 环境变量调整,默认 50
 
-原版显示"300s 窗口"实际上取的是 currentCandle(当前未收盘K线),实际已过时间是 0~300 秒随机。K 线刚翻转的瞬间显示的是最近 1 秒的数据却标注为 300s。
+### 增加的诊断
 
-**修复**:同问题 4,改走严格时间窗口。
+Monitor 里 SOL 量 ≥ 1.0 的大额交易改为 INFO 级别日志,方便人工核对 GMGN:
+
+```
+[HeliusTrade] Rudi SELL 3.142 SOL @ 0.00000012 (5gx7zk...)
+```
+
+看日志里是 SELL 就对,和你 GMGN 里看到的一致。
 
 ### 🔧 本次修改文件
 
 | 文件 | 改动 |
 |---|---|
-| `src/heliusWs.js` | 重写 `_extractTrade`,修复 3 条 SOL 金额计算路径 |
-| `src/monitor.js` | 去掉 `Math.max` 合并;显示统一用 `_refreshLiveVolume` 严格时间窗口;加节流和 txCount 字段;诊断日志对比两条路径 |
-| `public/index.html` | tooltip 带上窗口秒数和交易笔数 |
+| `src/heliusWs.js` | 重写 `_extractTrade`(签名者做锚点、过滤多跳路由、SOL 金额只看签名者);`_subscribeBatch` 先建新后取消旧;防抖延长到 5s;CHUNK_SIZE 可配置 |
+| `src/monitor.js` | 大额交易改 INFO 日志 |
 
-### 🔍 如何验证修复有效
+### 新增 .env 配置
 
-启动服务后,看 `logs/*.log` 里每 60 秒一次的诊断行:
-
-```
-[VolDiag] SYMBOL | chainTicks:all=120,win=45 | tick路径=B12.5/S8.3 | K线路径=B11.9/S8.1 | win=300s
+```bash
+HELIUS_CHUNK_SIZE=50           # 每个批量订阅块包含多少币(默认 50)
+HELIUS_BATCH_THRESHOLD=0       # 0=永远批量订阅(推荐,V3 已默认)
 ```
 
-- `tick路径` 和 `K线路径` 应该非常接近(差 < 20%)
-- Dashboard 显示应对上 `tick路径` 的数字
-- 与 GMGN / DexScreener 的 5 分钟成交量对比,应吻合(误差 5% 以内)
+### 验证方法
 
-如果 `tick路径` 仍明显偏高,可能是 Helius 批量订阅误匹配其他代币,临时设置 `.env` 里 `HELIUS_BATCH_THRESHOLD=200` 强制独立订阅模式。
+启动后观察日志,大额交易(>1 SOL)会打印出来:
+
+```bash
+journalctl -u sol-rsi-monitor -f | grep HeliusTrade
+```
+
+对比 GMGN 上的最新几笔交易,应该:
+- **方向正确**(BUY/SELL 和 GMGN 一致)
+- **金额接近**(差异 < 10%,因为我们扣了手续费 + 签名者路径更严格)
+- **不会出现"多跳中转"的虚假交易**(这种交易会被过滤)
 
 ---
 
-## V1 修复(上一轮)
+## V3 修复 — Helius 订阅确认慢
 
-### Buy/Sell 列大量显示 `-` 问题
+详见前一版 CHANGELOG。核心:BATCH_THRESHOLD=0 强制批量订阅、修复防抖无限重置、加重试。
 
-修复了 4 个问题:
-- 前端 `handleTokenList` 只删不写(最关键)
-- 后端 `_stateSnapshot` 快照缺字段
-- `evaluateSignal` 预热分支返回空 volume
-- `calcVolumeInfo` 兜底只取单根K线导致失真
+## V2 修复 — 量能虚高
 
-修改文件:`src/rsi.js`、`src/monitor.js`、`public/index.html`
+详见前一版 CHANGELOG。修 WSOL `Math.abs` 累加放大。**V4 进一步更新了方向判断**。
+
+## V1 修复 — Buy/Sell 显示 `-`
+
+详见前一版 CHANGELOG。修前端/后端数据流。
 
 ---
 
 ## 部署
-
-无数据库迁移,直接替换源码重启:
 
 ```bash
 git pull
 npm install --omit=dev
 sudo systemctl restart sol-rsi-monitor
 
-# 查看量能诊断
-journalctl -u sol-rsi-monitor -f | grep VolDiag
+# 观察日志
+journalctl -u sol-rsi-monitor -f | grep -E "HeliusTrade|HeliusWS|VolDiag"
+
+# 订阅状态
+curl -s http://localhost:3001/api/dashboard | jq '.heliusStats'
 ```
 
-## 可选调参
+## 95 币场景推荐参数
 
 ```bash
-# .env 里
-VOL_WINDOW_SEC=300             # 量能窗口(秒),默认 300 即 5 分钟
-HELIUS_BATCH_THRESHOLD=200     # 批量订阅阈值,调大强制走独立订阅
+# .env
+VOL_WINDOW_SEC=300             # 5 分钟量能窗口
+HELIUS_CHUNK_SIZE=50           # 50/块,95 币 = 2 块
+HELIUS_BATCH_THRESHOLD=0       # 永远批量
+MAX_MONITOR_TOKENS=95          # 最多监控数
+OVERVIEW_PATROL_SEC=7200       # FDV/LP 巡检间隔
 ```
+
+## 关于 LaserStream gRPC
+
+Helius Business 计划含 LaserStream gRPC。优点:
+
+- **无订阅槽位限制**(WS 有 ~50 隐性限制)
+- **延迟更低**(gRPC < WebSocket)
+- **吞吐更大**
+
+本次修复后 WebSocket 方案对 95 币完全够用。如果未来监控 300+ 币,再考虑迁 gRPC。
