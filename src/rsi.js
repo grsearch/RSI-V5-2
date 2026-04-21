@@ -467,33 +467,29 @@ function filterValidCandles(candles) {
  * @param {number} klineSec - K线宽度（秒）
  */
 function calcVolumeInfo(rawCandles, windowBars, klineSec) {
-  // 动态扩展：若标准窗口内无实时数据，最多扩展到8根
-  const maxLookback = Math.min(rawCandles.length, Math.max(windowBars, 8));
-  let winBuy = 0, winSell = 0, actualBars = windowBars;
+  // 始终累加最近 N 根实时K线的量能（不因找到数据就停止）
+  // 保底看最近8根（约40分钟），确保新K线开始时不会断档
+  const lookback = Math.min(rawCandles.length, Math.max(windowBars, 8));
+  const wc = rawCandles.slice(-lookback);
 
-  for (let wb = windowBars; wb <= maxLookback; wb++) {
-    winBuy = 0; winSell = 0;
-    const wc = rawCandles.slice(-wb);
-    for (const c of wc) {
-      if (c.fromHistory) continue; // 历史K线无方向数据
-      winBuy  += (c.buyVolume  || 0);
-      winSell += (c.sellVolume || 0);
-    }
-    actualBars = wb;
-    if (winBuy + winSell > 0) break;
+  let winBuy = 0, winSell = 0;
+  for (const c of wc) {
+    if (c.fromHistory) continue; // 历史K线无方向数据
+    winBuy  += (c.buyVolume  || 0);
+    winSell += (c.sellVolume || 0);
   }
 
   const winTotal = winBuy + winSell;
-  const recentLive = rawCandles.slice(-actualBars).filter(c => !c.fromHistory);
-  const currentVol = recentLive.length > 0
-    ? recentLive[recentLive.length - 1].volume || 0 : 0;
+  const liveCandlesInWindow = wc.filter(c => !c.fromHistory);
+  const currentVol = liveCandlesInWindow.length > 0
+    ? liveCandlesInWindow[liveCandlesInWindow.length - 1].volume || 0 : 0;
 
   return {
     currentVol,
     buyVol:   winBuy,
     sellVol:  winSell,
     buyRatio: winTotal > 0 ? winBuy / winTotal : 0,
-    windowSec: actualBars * klineSec,
+    windowSec: lookback * klineSec,
   };
 }
 

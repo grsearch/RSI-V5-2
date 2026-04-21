@@ -15,6 +15,7 @@ const fetch     = require('node-fetch');
 const logger    = require('./logger');
 
 const BIRDEYE_KEY  = process.env.BIRDEYE_API_KEY || '';
+const HELIUS_RPC_URL = process.env.HELIUS_RPC_URL || '';
 const BASE         = 'https://public-api.birdeye.so';
 // FDV/LP 缓存时间，默认30分钟（可通过 FDV_CACHE_MS 环境变量调整）
 // ★ V5: 从5分钟提升到30分钟，FDV变化不敏感，买入前会强制刷新
@@ -208,15 +209,35 @@ function _extractCreatedAt(data) {
     data.mint_time,
     data.listingTime,
     data.listing_time,
+    data.liquidityAddedAt,     // WS TOKEN_NEW_LISTING 里见过这个字段
+    data.firstAddLiquidityTime,
     data.extensions?.createdAt,
     data.extensions?.creationTime,
     data.extensions?.mintTime,
+    data.extensions?.liquidityAddedAt,
   ];
   for (const v of candidates) {
     const ms = _toMs(v);
     if (ms && ms > 1000000000000) return ms; // 合理范围：2001年以后
   }
   return null;
+}
+
+// 打印一次完整 data 用于调试 createdAt 字段名（只打一次避免刷屏）
+let _overviewDataLogged = false;
+function _logOverviewData(address, data) {
+  if (_overviewDataLogged) return;
+  _overviewDataLogged = true;
+  logger.warn('[Birdeye] ===== overview 完整字段 (调试用，仅此一次) =====');
+  logger.warn('[Birdeye] 地址: %s', address);
+  logger.warn('[Birdeye] keys: %s', JSON.stringify(Object.keys(data)));
+  // 打印所有值不为空且类型为number的字段（可能是时间戳）
+  const numFields = {};
+  for (const [k, v] of Object.entries(data)) {
+    if (typeof v === 'number' && v > 1000000000) numFields[k] = v;
+  }
+  logger.warn('[Birdeye] 数值型字段(可能含时间戳): %s', JSON.stringify(numFields));
+  logger.warn('[Birdeye] ================================================');
 }
 
 async function _fetchOverview(address) {
@@ -250,10 +271,11 @@ async function _fetchOverview(address) {
     // 保留旧缓存中的 createdAt（不会变）
     if (!entry.createdAt && cached?.createdAt) entry.createdAt = cached.createdAt;
 
-    // createdAt 仍未找到 → 尝试 meta-data/single 接口
+    // createdAt 仍未找到 → 打印调试信息 + 尝试 meta-data/single 接口
     if (!entry.createdAt) {
-      logger.debug('[Birdeye] overview %s 无createdAt，尝试meta-data接口 keys=%s',
-        address.slice(0, 8), Object.keys(data).join(','));
+      _logOverviewData(address, data);
+      logger.warn('[Birdeye] overview %s 无createdAt，尝试meta-data接口',
+        address.slice(0, 8));
       try {
         const metaTs = await _fetchMetaCreatedAt(address);
         if (metaTs) entry.createdAt = metaTs;
@@ -275,20 +297,54 @@ async function _fetchOverview(address) {
   }
 }
 
-// 备用：从 meta-data/single 接口获取 createdAt
+// 备用：从 Helius getAsset 获取代币创建时间（比 Birdeye 更可靠）
 async function _fetchMetaCreatedAt(address) {
+  if (!HELIUS_RPC_URL) return null;
+
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 5000);
   try {
-    const url = `${BASE}/defi/v3/token/meta-data/single?address=${address}`;
-    const res = await fetch(url, {
-      headers: { 'X-API-KEY': BIRDEYE_KEY, 'x-chain': 'solana' },
+    const res = await fetch(HELIUS_RPC_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'get-asset-age',
+        method: 'getAsset',
+        params: { id: address },
+      }),
       signal: controller.signal,
     });
     if (!res.ok) return null;
     const json = await res.json();
-    const data = json?.data || {};
-    return _extractCreatedAt(data);
+    const result = json?.result || {};
+
+    // getAsset 返回的创建时间字段
+    const candidates = [
+      result.createdAt,
+      result.created_at,
+      result.mint_extensions?.permanentDelegate?.delegate,  // 不是时间戳，跳过
+      result.token_info?.price_info?.currency,              // 不是时间戳，跳过
+    ];
+
+    // Helius getAsset 里 createdAt 是 Unix 秒级时间戳
+    for (const v of [result.createdAt, result.created_at]) {
+      const ms = _toMs(v);
+      if (ms && ms > 1000000000000) {
+        logger.debug('[Birdeye] Helius getAsset %s createdAt=%s',
+          address.slice(0, 8), new Date(ms).toISOString());
+        return ms;
+      }
+    }
+
+    // 如果 getAsset 没有 createdAt，尝试从 content.metadata 里找
+    const metadata = result.content?.metadata || result.content || {};
+    for (const v of [metadata.createdAt, metadata.created_at, metadata.mint_time]) {
+      const ms = _toMs(v);
+      if (ms && ms > 1000000000000) return ms;
+    }
+
+    return null;
   } catch (_) {
     return null;
   } finally {
