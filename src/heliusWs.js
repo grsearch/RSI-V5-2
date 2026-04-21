@@ -383,13 +383,14 @@ class HeliusTradeStream {
     const tokenDelta = Math.abs(maxBuyDelta) >= Math.abs(maxSellDelta) ? maxBuyDelta : maxSellDelta;
     if (Math.abs(tokenDelta) < 1e-9) return null;
 
-    // ── 2. 计算 SOL 净流入/流出 ───────────────────────────────────
-    // 策略1：原生 SOL 余额变化总和（取非程序账户的变化，排除 AMM 池子账户）
-    let nativeSolDelta = 0;
+    // ── 2. 计算 SOL 金额 ─────────────────────────────────────────
+    // 策略1：找最大单账户 SOL 变化（Pump AMM：买入时用户 SOL 减少，卖出时增加）
+    // 不用总和，因为买卖双方抵消后净值接近0（只剩手续费）
+    let maxNativeSolChange = 0;
     for (let i = 0; i < preBalances.length && i < postBalances.length; i++) {
-      nativeSolDelta += postBalances[i] - preBalances[i];
+      const delta = Math.abs(postBalances[i] - preBalances[i]) / LAMPORTS;
+      if (delta > maxNativeSolChange) maxNativeSolChange = delta;
     }
-    nativeSolDelta /= LAMPORTS;
 
     // 策略2：WSOL token 余额净变化（Meteora/Raydium CLMM 等）
     let wsolNetDelta = 0;
@@ -399,28 +400,15 @@ class HeliusTradeStream {
       const wr = wsolPre.find(b => b.accountIndex === wp.accountIndex || b.owner === wp.owner);
       const postAmt = parseFloat((wp.uiTokenAmount && wp.uiTokenAmount.uiAmount) || '0');
       const preAmt  = wr ? parseFloat((wr.uiTokenAmount && wr.uiTokenAmount.uiAmount) || '0') : 0;
-      wsolNetDelta += postAmt - preAmt;
+      wsolNetDelta += Math.abs(postAmt - preAmt);
     }
 
     // ── 3. 判断买卖方向 ───────────────────────────────────────────
-    // token 增加 = 买入（用 SOL 买了 token）
-    // token 减少 = 卖出（卖了 token 换 SOL）
     const isBuy  = tokenDelta > 0;
     const isSell = tokenDelta < 0;
 
-    // 计算 SOL 金额（取绝对值最大的那个来源）
-    // 买入：SOL 流出（负值），卖出：SOL 流入（正值）
-    let solAmount = 0;
-    if (Math.abs(wsolNetDelta) > Math.abs(nativeSolDelta) * 0.5 + 1e-6) {
-      // WSOL 变化更显著（Meteora 等）
-      solAmount = Math.abs(wsolNetDelta);
-    } else if (Math.abs(nativeSolDelta) > 1e-6) {
-      // 原生 SOL 变化（Pump AMM 等）
-      solAmount = Math.abs(nativeSolDelta);
-    } else {
-      // 两者都很小，仍记录交易但 SOL 金额为 0（不影响方向判断）
-      solAmount = 0;
-    }
+    // 取两个策略中较大的 SOL 金额
+    const solAmount = Math.max(maxNativeSolChange, wsolNetDelta);
 
     const absTokenDelta = Math.abs(tokenDelta);
     return {
