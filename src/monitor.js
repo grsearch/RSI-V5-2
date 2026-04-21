@@ -713,6 +713,24 @@ class TokenMonitor extends EventEmitter {
 
     // 7. RSI + 量能信号评估
     const realtimePrice = currentCandle?.close ?? price;
+
+    // ★ 诊断日志：打印量能数据来源（每个币每60秒一次）
+    if (!state._lastVolLog || Date.now() - state._lastVolLog > 60000) {
+      state._lastVolLog = Date.now();
+      const chainTicks = state.ticks.filter(t => t.source === 'chain');
+      const rawChainBuys  = rawForVolume.filter(c => !c.fromHistory).reduce((s,c)=>s+(c.buyVolume||0),0);
+      const rawChainSells = rawForVolume.filter(c => !c.fromHistory).reduce((s,c)=>s+(c.sellVolume||0),0);
+      logger.info('[VolDiag] %s | chainTicks=%d | rawCandles=%d(live=%d,hist=%d) | buyVol=%.4f sellVol=%.4f | currentCandle=%s',
+        state.symbol,
+        chainTicks.length,
+        rawForVolume.length,
+        rawForVolume.filter(c=>!c.fromHistory).length,
+        rawForVolume.filter(c=>c.fromHistory).length,
+        rawChainBuys, rawChainSells,
+        currentCandle ? `open=${new Date(currentCandle.openTime).toISOString().slice(11,19)} buy=${(currentCandle.buyVolume||0).toFixed(4)} sell=${(currentCandle.sellVolume||0).toFixed(4)}` : 'null'
+      );
+    }
+
     const { rsi, prevRsi, signal, reason, volume, candleTs: signalCandleTs } = evaluateSignal(closedCandles, realtimePrice, state, rawForVolume);
 
     // 8. 记录信号
