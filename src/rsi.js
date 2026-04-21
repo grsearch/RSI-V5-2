@@ -109,6 +109,7 @@ function checkBuyVolume(closedCandles, currentCandle) {
   let totalBuy  = 0;
   let totalSell = 0;
   for (const c of windowCandles) {
+    if (c.fromHistory) continue;  // 历史K线无买卖方向数据，跳过
     totalBuy  += (c.buyVolume  || 0);
     totalSell += (c.sellVolume || 0);
   }
@@ -273,17 +274,24 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState) {
   };
 
   // 量能信息
+  // ★ 只统计实时K线（fromHistory !== true）的买卖量，历史K线没有方向数据
   const latestCandle = closedCandles[len - 1];
   const windowBars = Math.max(1, Math.ceil(VOL_WINDOW_SEC / KLINE_SEC));
   const windowCandles = closedCandles.slice(-windowBars);
   let winBuy = 0, winSell = 0;
   for (const c of windowCandles) {
+    if (c.fromHistory) continue;   // 跳过历史K线，它们无买卖方向数据
     winBuy  += (c.buyVolume  || 0);
     winSell += (c.sellVolume || 0);
   }
   const winTotal = winBuy + winSell;
+  // currentVol 也只取实时K线的量（历史K线volume是总量非方向量，意义不同）
+  const liveLatest = windowCandles.filter(c => !c.fromHistory);
+  const currentVol = liveLatest.length > 0
+    ? liveLatest[liveLatest.length - 1].volume || 0
+    : 0;
   const volumeInfo = {
-    currentVol: latestCandle.volume || 0,
+    currentVol,
     buyVol:  winBuy,
     sellVol: winSell,
     buyRatio: winTotal > 0 ? winBuy / winTotal : 0,
@@ -471,9 +479,24 @@ function buildCandles(ticks, intervalSec = KLINE_SEC) {
 /**
  * 过滤掉 open 为 null 的 K 线（只有链上 tick，没有价格数据的 K 线）
  * RSI 计算前调用
+ * ★ 修复：被过滤的K线的 buyVolume/sellVolume 合并到前一根有效K线，防止量能数据丢失
  */
 function filterValidCandles(candles) {
-  return candles.filter(c => c.open !== null && c.close !== null);
+  const valid = [];
+  for (const c of candles) {
+    if (c.open !== null && c.close !== null) {
+      valid.push(c);
+    } else {
+      // 无价格数据的K线：把量能合并到上一根有效K线
+      if (valid.length > 0 && (c.volume > 0 || c.buyVolume > 0 || c.sellVolume > 0)) {
+        const prev = valid[valid.length - 1];
+        prev.volume     = (prev.volume     || 0) + (c.volume     || 0);
+        prev.buyVolume  = (prev.buyVolume  || 0) + (c.buyVolume  || 0);
+        prev.sellVolume = (prev.sellVolume || 0) + (c.sellVolume || 0);
+      }
+    }
+  }
+  return valid;
 }
 
 module.exports = {
