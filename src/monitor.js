@@ -522,8 +522,8 @@ class TokenMonitor extends EventEmitter {
         // ── 2. RSI 卖出检查（双重方式：已收盘K线 + stepRSI实时估算） ──
         if (state.ticks.length > 0) {
           const { closed: rawCandles } = buildCandles(state.ticks, KLINE_SEC);
-          const liveCandles = filterValidCandles(rawCandles);
-          // ★ 合并历史K线
+          const liveCandles = filterValidCandles(rawCandles); // RSI用
+          // ★ 合并历史K线（RSI用）
           let closedCandles = liveCandles;
           if (state.historicalCandles && state.historicalCandles.length > 0) {
             const liveStart2 = liveCandles.length > 0 ? liveCandles[0].openTime : Infinity;
@@ -691,18 +691,25 @@ class TokenMonitor extends EventEmitter {
 
     // 6. 聚合 K 线（历史K线 + 实时ticks合并）
     const { closed: rawClosedCandles, current: currentCandle } = buildCandles(state.ticks, KLINE_SEC);
-    const liveClosed = filterValidCandles(rawClosedCandles);
-    // ★ 合并历史K线：历史candles在前，实时candles在后，去除时间重叠部分
+    const liveClosed = filterValidCandles(rawClosedCandles); // RSI用：只含真实价格K线
+    // ★ 合并历史K线（RSI/EMA用）：历史candles在前，实时candles在后
     let closedCandles = liveClosed;
     if (state.historicalCandles && state.historicalCandles.length > 0) {
       const liveStart = liveClosed.length > 0 ? liveClosed[0].openTime : Infinity;
       const histFiltered = state.historicalCandles.filter(c => c.openTime < liveStart);
       closedCandles = [...histFiltered, ...liveClosed];
     }
+    // ★ 量能用：原始K线（含无价格的链上K线），历史K线在前，原始实时K线在后
+    let rawForVolume = rawClosedCandles;
+    if (state.historicalCandles && state.historicalCandles.length > 0) {
+      const liveStart = rawClosedCandles.length > 0 ? rawClosedCandles[0].openTime : Infinity;
+      const histFiltered = state.historicalCandles.filter(c => c.openTime < liveStart);
+      rawForVolume = [...histFiltered, ...rawClosedCandles];
+    }
 
     // 7. RSI + 量能信号评估
     const realtimePrice = currentCandle?.close ?? price;
-    const { rsi, prevRsi, signal, reason, volume, candleTs: signalCandleTs } = evaluateSignal(closedCandles, realtimePrice, state);
+    const { rsi, prevRsi, signal, reason, volume, candleTs: signalCandleTs } = evaluateSignal(closedCandles, realtimePrice, state, rawForVolume);
 
     // 8. 记录信号
     if (reason && reason !== '' && reason !== 'rsi_rebase') {

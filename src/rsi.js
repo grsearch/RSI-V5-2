@@ -104,18 +104,9 @@ function checkBuyVolume(closedCandles, currentCandle) {
     return { pass: false, reason: 'VOL_INSUFFICIENT_DATA', buyVol: 0, sellVol: 0, ratio: 0 };
   }
 
-  // ★ 动态扩展窗口：若标准窗口内全是历史K线，往前多看最多8根
-  let totalBuy = 0, totalSell = 0;
-  for (let wb = windowBars; wb <= Math.min(allCandles.length, 8); wb++) {
-    totalBuy = 0; totalSell = 0;
-    const wc = allCandles.slice(-wb);
-    for (const c of wc) {
-      if (c.fromHistory) continue;  // 历史K线无买卖方向数据，跳过
-      totalBuy  += (c.buyVolume  || 0);
-      totalSell += (c.sellVolume || 0);
-    }
-    if (totalBuy + totalSell > 0) break; // 找到实时数据，停止扩展
-  }
+  // ★ 用 calcVolumeInfo 计算量能（自动扩展窗口，跳过历史K线）
+  const _volInfo = calcVolumeInfo(allCandles, windowBars, KLINE_SEC);
+  let totalBuy = _volInfo.buyVol, totalSell = _volInfo.sellVol;
 
   const total = totalBuy + totalSell;
   const ratio = total > 0 ? totalBuy / total : 0;
@@ -228,7 +219,7 @@ function checkStopLoss(currentPrice, tokenState) {
 
 // ── 主信号函数 ─────────────────────────────────────────────────────
 
-function evaluateSignal(closedCandles, realtimePrice, tokenState) {
+function evaluateSignal(closedCandles, realtimePrice, tokenState, rawCandles) {
   const MIN_CANDLES = RSI_PERIOD + 2;
   if (!closedCandles || closedCandles.length < MIN_CANDLES) {
     return { rsi: NaN, prevRsi: NaN, signal: null, reason: 'warming_up', volume: {} };
@@ -276,37 +267,11 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState) {
     tokenState._prevRsiTs       = nowMs;
   };
 
-  // 量能信息
-  // ★ 只统计实时K线（fromHistory !== true）的买卖量，历史K线没有方向数据
-  // ★ 动态扩展窗口：从最近1根开始，若全是历史K线则往前多看，直到找到实时数据或扫完所有K线
-  const latestCandle = closedCandles[len - 1];
+  // 量能信息：从原始K线（rawCandles）单独计算，不依赖 RSI 用的 closedCandles
+  // 这样量能数据（含无价格的链上K线）和 RSI（仅有价格的K线）完全分离
   const windowBars = Math.max(1, Math.ceil(VOL_WINDOW_SEC / KLINE_SEC));
-  // 先用标准窗口，若无实时数据则逐步扩展到最多8根（约40分钟）
-  let winBuy = 0, winSell = 0, actualWindowBars = windowBars;
-  for (let wb = windowBars; wb <= Math.min(len, 8); wb++) {
-    winBuy = 0; winSell = 0;
-    const wc = closedCandles.slice(-wb);
-    for (const c of wc) {
-      if (c.fromHistory) continue;   // 跳过历史K线，它们无买卖方向数据
-      winBuy  += (c.buyVolume  || 0);
-      winSell += (c.sellVolume || 0);
-    }
-    actualWindowBars = wb;
-    if (winBuy + winSell > 0) break; // 找到实时数据了，停止扩展
-  }
-  const winTotal = winBuy + winSell;
-  // currentVol 取最近实时K线的量
-  const recentLive = closedCandles.slice(-actualWindowBars).filter(c => !c.fromHistory);
-  const currentVol = recentLive.length > 0
-    ? recentLive[recentLive.length - 1].volume || 0
-    : 0;
-  const volumeInfo = {
-    currentVol,
-    buyVol:  winBuy,
-    sellVol: winSell,
-    buyRatio: winTotal > 0 ? winBuy / winTotal : 0,
-    windowSec: actualWindowBars * KLINE_SEC,
-  };
+  const _rawForVol = rawCandles || closedCandles; // 兼容未传 rawCandles 的情况
+  const volumeInfo = calcVolumeInfo(_rawForVol, windowBars, KLINE_SEC);
 
   // ── SELL 优先（持仓中） ────────────────────────────────────────
   if (tokenState.inPosition) {
@@ -487,41 +452,56 @@ function buildCandles(ticks, intervalSec = KLINE_SEC) {
 }
 
 /**
- * 过滤K线：保留有价格数据的K线，同时保留有量能数据的K线（即使没有价格）
- * 对于只有链上交易、无价格的K线：用前一根K线的 close 补全价格，参与量能统计
- * 这样既保证 RSI 计算不出错，又不丢失链上交易的量能数据（Openclaw方案）
+ * 过滤K线用于 RSI/EMA 计算：只保留有真实价格数据的K线
+ * 量能统计由 calcVolumeInfo() 单独从原始 rawCandles 里取，两者完全分离
  */
 function filterValidCandles(candles) {
-  const valid = [];
-  let lastClose = null;
+  return candles.filter(c => c.open !== null && c.close !== null);
+}
 
-  for (const c of candles) {
-    if (c.open !== null && c.close !== null) {
-      // 正常K线：直接保留，更新 lastClose
-      valid.push(c);
-      lastClose = c.close;
-    } else if (c.volume > 0 || c.buyVolume > 0 || c.sellVolume > 0) {
-      // 只有链上量能、无价格的K线：用上一根的收盘价补全，保留量能数据
-      if (lastClose !== null) {
-        valid.push({
-          ...c,
-          open:  lastClose,
-          high:  lastClose,
-          low:   lastClose,
-          close: lastClose,
-        });
-      }
-      // lastClose 不变（价格没有新数据）
+/**
+ * 从原始K线（含无价格的量能K线）计算量能信息
+ * 不依赖 filterValidCandles，直接扫描所有K线的 buyVolume/sellVolume
+ * @param {Array} rawCandles - buildCandles 返回的未过滤K线
+ * @param {number} windowBars - 统计窗口（根数）
+ * @param {number} klineSec - K线宽度（秒）
+ */
+function calcVolumeInfo(rawCandles, windowBars, klineSec) {
+  // 动态扩展：若标准窗口内无实时数据，最多扩展到8根
+  const maxLookback = Math.min(rawCandles.length, Math.max(windowBars, 8));
+  let winBuy = 0, winSell = 0, actualBars = windowBars;
+
+  for (let wb = windowBars; wb <= maxLookback; wb++) {
+    winBuy = 0; winSell = 0;
+    const wc = rawCandles.slice(-wb);
+    for (const c of wc) {
+      if (c.fromHistory) continue; // 历史K线无方向数据
+      winBuy  += (c.buyVolume  || 0);
+      winSell += (c.sellVolume || 0);
     }
-    // 既无价格又无量能的K线：直接丢弃
+    actualBars = wb;
+    if (winBuy + winSell > 0) break;
   }
-  return valid;
+
+  const winTotal = winBuy + winSell;
+  const recentLive = rawCandles.slice(-actualBars).filter(c => !c.fromHistory);
+  const currentVol = recentLive.length > 0
+    ? recentLive[recentLive.length - 1].volume || 0 : 0;
+
+  return {
+    currentVol,
+    buyVol:   winBuy,
+    sellVol:  winSell,
+    buyRatio: winTotal > 0 ? winBuy / winTotal : 0,
+    windowSec: actualBars * klineSec,
+  };
 }
 
 module.exports = {
   evaluateSignal,
   buildCandles,
   filterValidCandles,
+  calcVolumeInfo,
   calcRSIWithState,
   stepRSI,
   checkBuyVolume,
