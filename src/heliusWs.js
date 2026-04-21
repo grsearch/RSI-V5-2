@@ -146,7 +146,7 @@ class HeliusTradeStream {
       } else if (this._tokens.size > BATCH_THRESHOLD) {
         // ★ 代币数超过阈值：用批量订阅（一个subscription覆盖所有mint）
         // 避免超过Helius单连接最大订阅数量限制
-        setTimeout(() => this._subscribeBatch(), 500);
+        setTimeout(() => this._subscribeBatch(), 1000);
       } else {
         // ★ 按顺序延迟恢复订阅，每个间隔150ms，避免瞬间大量请求压垮连接
         let i = 0;
@@ -247,7 +247,19 @@ class HeliusTradeStream {
     const addresses = Array.from(this._tokens.keys());
     if (addresses.length === 0) return;
 
-    // 先取消所有已有独立订阅
+    // ★ 先取消旧的批量订阅（避免累积悬空订阅）
+    if (this._batchSubId) {
+      const rid = this._nextRpcId++;
+      this._ws.send(JSON.stringify({
+        jsonrpc: '2.0', id: rid,
+        method: 'transactionUnsubscribe',
+        params: [this._batchSubId],
+      }));
+      this._batchSubId = null;
+      logger.debug('[HeliusWS] 取消旧批量订阅');
+    }
+
+    // 取消所有已有独立订阅
     for (const [addr, info] of this._tokens.entries()) {
       if (info.subId) {
         const rid = this._nextRpcId++;
@@ -278,8 +290,7 @@ class HeliusTradeStream {
       ],
     }));
     this._batchSubId = null; // 等确认后设置
-    this._batchRpcId = rpcId;
-    logger.info('[HeliusWS] 📡 批量订阅 %d 个 token（一个subscription覆盖全部）', addresses.length);
+    logger.info('[HeliusWS] 📡 批量订阅 %d 个 token', addresses.length);
   }
 
   _unsubscribeToken(tokenAddress) {
@@ -317,11 +328,11 @@ class HeliusTradeStream {
 
     if (!this._isPumpMode() && this._connected) {
       if (this._tokens.size > BATCH_THRESHOLD) {
-        // ★ 超过阈值：触发批量重订阅（包含新加入的token）
+        // ★ 超过阈值：触发批量重订阅（3秒debounce，等待连续加入的代币都注册完再统一订阅）
         clearTimeout(this._batchDebounce);
         this._batchDebounce = setTimeout(() => {
           if (this._connected && !this._isPumpMode()) this._subscribeBatch();
-        }, 500);
+        }, 3000);
       } else {
         // token 模式：发送独立订阅（稍微延迟，避免连发）
         setTimeout(() => {
