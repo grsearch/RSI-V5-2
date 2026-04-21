@@ -36,6 +36,8 @@ const HELIUS_RPC_URL         = process.env.HELIUS_RPC_URL || '';
 const CFG_SUB_MODE    = (process.env.HELIUS_SUB_MODE || 'token').toLowerCase();
 // auto 模式下，超过此数量自动切换到 pump 单订阅
 const TOKEN_LIMIT     = parseInt(process.env.HELIUS_TOKEN_LIMIT || '50', 10);
+// 超过此数量时，改用批量订阅（一个subscription包含所有mint），避免超过Helius单连接订阅上限
+const BATCH_THRESHOLD = parseInt(process.env.HELIUS_BATCH_THRESHOLD || '30', 10);
 
 function getWsUrl() {
   if (HELIUS_GATEKEEPER_URL) {
@@ -83,6 +85,8 @@ class HeliusTradeStream {
 
     // pump 模式的 subId
     this._pumpSubId = null;
+    this._batchSubId = null;   // 批量订阅的 subscriptionId
+    this._batchDebounce = null; // 批量重订阅的防抖timer
 
     // ★ 实际激活的模式（auto模式下动态变化）
     // 初始值根据配置决定：手动指定 pump/token 则固定，auto 则从 token 开始
@@ -139,6 +143,10 @@ class HeliusTradeStream {
       // 重连后恢复订阅（用当前激活的模式）
       if (this._isPumpMode()) {
         this._subscribePumpAmm();
+      } else if (this._tokens.size > BATCH_THRESHOLD) {
+        // ★ 代币数超过阈值：用批量订阅（一个subscription覆盖所有mint）
+        // 避免超过Helius单连接最大订阅数量限制
+        setTimeout(() => this._subscribeBatch(), 500);
       } else {
         // ★ 按顺序延迟恢复订阅，每个间隔150ms，避免瞬间大量请求压垮连接
         let i = 0;
@@ -232,6 +240,48 @@ class HeliusTradeStream {
       info?.symbol || '?', tokenAddress.slice(0, 8) + '...');
   }
 
+  // ★ 批量重订阅：用一个包含所有 mint 的 accountInclude 替换所有独立订阅
+  // 解决 Helius 单连接订阅数量上限问题（通常50-100个）
+  _subscribeBatch() {
+    if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
+    const addresses = Array.from(this._tokens.keys());
+    if (addresses.length === 0) return;
+
+    // 先取消所有已有独立订阅
+    for (const [addr, info] of this._tokens.entries()) {
+      if (info.subId) {
+        const rid = this._nextRpcId++;
+        this._ws.send(JSON.stringify({
+          jsonrpc: '2.0', id: rid,
+          method: 'transactionUnsubscribe',
+          params: [info.subId],
+        }));
+        info.subId = null;
+      }
+    }
+
+    // 发一个包含所有 mint 的批量订阅
+    const rpcId = this._nextRpcId++;
+    this._pendingSubs.set(rpcId, '__batch__');
+    this._ws.send(JSON.stringify({
+      jsonrpc: '2.0',
+      id: rpcId,
+      method: 'transactionSubscribe',
+      params: [
+        { accountInclude: addresses, failed: false },
+        {
+          commitment: 'confirmed',
+          encoding: 'jsonParsed',
+          transactionDetails: 'full',
+          maxSupportedTransactionVersion: 0,
+        },
+      ],
+    }));
+    this._batchSubId = null; // 等确认后设置
+    this._batchRpcId = rpcId;
+    logger.info('[HeliusWS] 📡 批量订阅 %d 个 token（一个subscription覆盖全部）', addresses.length);
+  }
+
   _unsubscribeToken(tokenAddress) {
     const info = this._tokens.get(tokenAddress);
     if (!info?.subId) return;
@@ -266,12 +316,20 @@ class HeliusTradeStream {
     }
 
     if (!this._isPumpMode() && this._connected) {
-      // token 模式：发送独立订阅（稍微延迟，避免连发）
-      setTimeout(() => {
-        if (this._tokens.has(tokenAddress) && this._connected && !this._isPumpMode()) {
-          this._subscribeToken(tokenAddress);
-        }
-      }, 50);
+      if (this._tokens.size > BATCH_THRESHOLD) {
+        // ★ 超过阈值：触发批量重订阅（包含新加入的token）
+        clearTimeout(this._batchDebounce);
+        this._batchDebounce = setTimeout(() => {
+          if (this._connected && !this._isPumpMode()) this._subscribeBatch();
+        }, 500);
+      } else {
+        // token 模式：发送独立订阅（稍微延迟，避免连发）
+        setTimeout(() => {
+          if (this._tokens.has(tokenAddress) && this._connected && !this._isPumpMode()) {
+            this._subscribeToken(tokenAddress);
+          }
+        }, 50);
+      }
     }
     // pump 模式：全局订阅已覆盖，无需额外操作
 
@@ -328,6 +386,10 @@ class HeliusTradeStream {
         this._pumpSubId = msg.result;
         this._pendingSubs.delete(msg.id);
         logger.info('[HeliusWS] ✅ Pump AMM 订阅确认 subId=%s', msg.result);
+      } else if (key === '__batch__') {
+        this._batchSubId = msg.result;
+        this._pendingSubs.delete(msg.id);
+        logger.info('[HeliusWS] ✅ 批量订阅确认 subId=%s，覆盖 %d 个token', msg.result, this._tokens.size);
       } else if (key) {
         this._pendingSubs.delete(msg.id);
         const info = this._tokens.get(key);
@@ -382,6 +444,23 @@ class HeliusTradeStream {
         if (!matched) this._stats.txSkipped++;
       } else {
         // ── token 模式：通过 subscriptionId 精准匹配 ──
+        // 批量订阅时，所有token共用同一个 batchSubId
+        if (this._batchSubId && subscriptionId === this._batchSubId) {
+          // 批量模式：用 mint 匹配
+          const involvedMints = new Set((meta.postTokenBalances || []).map(b => b.mint).filter(Boolean));
+          for (const mint of involvedMints) {
+            const tokenInfo = this._tokens.get(mint);
+            if (!tokenInfo) continue;
+            this._stats.txMatched++;
+            const trade = this._extractTrade(mint, meta, txData, signature);
+            if (trade) {
+              this._stats.txParsed++;
+              tokenInfo.onTrade(trade);
+            }
+          }
+          return;
+        }
+
         let targetToken = null;
         for (const [addr, info] of this._tokens.entries()) {
           if (info.subId === subscriptionId) {
