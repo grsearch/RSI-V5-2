@@ -53,8 +53,11 @@ class HeliusTradeStream {
     this._tokens      = new Map(); // address → { symbol, onTrade, subId }
     this._pendingSubs = new Map(); // rpcId → address | '__batch__'
     this._nextRpcId   = 100;
+    this._batchSubIds   = [];
     this._batchSubId    = null;
-    this._batchDebounce = null;
+    this._batchDebounce    = null;
+    this._batchTimeoutTimer = null;
+    this._CHUNK_SIZE        = 50;
     this._stats = { txReceived: 0, txMatched: 0, txParsed: 0, txSkipped: 0, connType: 'none' };
   }
 
@@ -66,7 +69,7 @@ class HeliusTradeStream {
     }
     this._connType = type;
     this._stats.connType = type;
-    logger.info('[HeliusWS] 启动 | 批量订阅阈值=%d', BATCH_THRESHOLD);
+    logger.info(`[HeliusWS] 启动 | 批量订阅阈值=${BATCH_THRESHOLD}`);
     this._connect(url);
   }
 
@@ -85,8 +88,7 @@ class HeliusTradeStream {
     if (!this._statsTimer) {
       this._statsTimer = setInterval(() => {
         const s = this.getStats();
-        logger.info('[HeliusWS] 状态: tokens=%d subMode=%s batchSubId=%s txReceived=%d txMatched=%d txParsed=%d',
-          s.tokens, s.subMode, s.batchSubId || 'none', s.txReceived, s.txMatched, s.txParsed);
+        logger.info(`[HeliusWS] 状态: tokens=${s.tokens} subMode=${s.subMode} batchSubId=${s.batchSubId||'none'} txReceived=${s.txReceived} txMatched=${s.txMatched} txParsed=${s.txParsed}`);
       }, 60000);
     }
 
@@ -96,7 +98,8 @@ class HeliusTradeStream {
       logger.info('[HeliusWS] ✅ 已连接 (%s)', this._connType);
       this._connected  = true;
       this._retryCount = 0;
-      this._batchSubId = null;
+      this._batchSubId  = null;
+      this._batchSubIds = [];
 
       this._pingTimer = setInterval(() => {
         if (this._ws && this._ws.readyState === WebSocket.OPEN) this._ws.ping();
@@ -107,19 +110,20 @@ class HeliusTradeStream {
 
     this._ws.on('message', (data) => this._handleMessage(data));
     this._ws.on('pong', () => {});
-    this._ws.on('error', (err) => logger.error('[HeliusWS] 错误: %s', err.message));
+    this._ws.on('error', (err) => logger.error(`[HeliusWS] 错误: ${err.message}`));
 
     this._ws.on('close', () => {
       logger.warn('[HeliusWS] 连接关闭');
       this._connected  = false;
-      this._batchSubId = null;
+      this._batchSubId  = null;
+      this._batchSubIds = [];
       this._pendingSubs.clear();
       if (this._pingTimer) { clearInterval(this._pingTimer); this._pingTimer = null; }
 
       if (this._retryCount < MAX_RETRIES) {
         this._retryCount++;
         const delay = Math.min(RECONNECT_MS * Math.pow(1.5, this._retryCount - 1), 30000);
-        logger.info('[HeliusWS] %ds 后重连 (第%d次)', (delay / 1000).toFixed(0), this._retryCount);
+        logger.info(`[HeliusWS] ${(delay/1000).toFixed(0)}s 后重连 (第${this._retryCount}次)`);
         setTimeout(() => {
           const { url } = getWsUrl();
           if (url) this._connect(url);
@@ -158,7 +162,7 @@ class HeliusTradeStream {
       ],
     }));
     const info = this._tokens.get(tokenAddress);
-    logger.debug('[HeliusWS] 独立订阅 %s', (info && info.symbol) || tokenAddress.slice(0, 8));
+    logger.debug(`[HeliusWS] 独立订阅 ${(info && info.symbol) || tokenAddress.slice(0,8)}`);
   }
 
   _unsubscribeToken(tokenAddress) {
@@ -179,15 +183,17 @@ class HeliusTradeStream {
     const addresses = Array.from(this._tokens.keys());
     if (addresses.length === 0) return;
 
-    // 取消旧的批量订阅
-    if (this._batchSubId) {
+    // 取消所有旧的批量订阅
+    for (const oldSubId of this._batchSubIds) {
       this._ws.send(JSON.stringify({
         jsonrpc: '2.0', id: this._nextRpcId++,
         method: 'transactionUnsubscribe',
-        params: [this._batchSubId],
+        params: [oldSubId],
       }));
-      this._batchSubId = null;
     }
+    this._batchSubIds = [];
+    this._batchSubId  = null;
+
     // 取消所有独立订阅
     for (const info of this._tokens.values()) {
       if (info.subId) {
@@ -200,17 +206,47 @@ class HeliusTradeStream {
       }
     }
 
-    const rpcId = this._nextRpcId++;
-    this._pendingSubs.set(rpcId, '__batch__');
-    this._ws.send(JSON.stringify({
-      jsonrpc: '2.0', id: rpcId,
-      method: 'transactionSubscribe',
-      params: [
-        { accountInclude: addresses, failed: false },
-        { commitment: 'confirmed', encoding: 'jsonParsed', transactionDetails: 'full', maxSupportedTransactionVersion: 0 },
-      ],
-    }));
-    logger.info('[HeliusWS] 📡 批量订阅 %d 个 token', addresses.length);
+    // 分块发送批量订阅（每块最多 CHUNK_SIZE 个地址）
+    const chunks = [];
+    for (let i = 0; i < addresses.length; i += this._CHUNK_SIZE) {
+      chunks.push(addresses.slice(i, i + this._CHUNK_SIZE));
+    }
+
+    logger.info(`[HeliusWS] 📡 批量订阅 ${addresses.length} 个 token，分 ${chunks.length} 块`);
+
+    chunks.forEach((chunk, idx) => {
+      const rpcId = this._nextRpcId++;
+      this._pendingSubs.set(rpcId, `__batch_${idx}__`);
+      this._ws.send(JSON.stringify({
+        jsonrpc: '2.0', id: rpcId,
+        method: 'transactionSubscribe',
+        params: [
+          { accountInclude: chunk, failed: false },
+          { commitment: 'confirmed', encoding: 'jsonParsed', transactionDetails: 'full', maxSupportedTransactionVersion: 0 },
+        ],
+      }));
+      logger.info(`[HeliusWS] 📡 块[${idx+1}/${chunks.length}] ${chunk.length} 个 token rpcId=${rpcId}`);
+    });
+
+    // ★ 超时降级：若5秒内未收到任何批量订阅确认，自动回退到独立订阅
+    clearTimeout(this._batchTimeoutTimer);
+    this._batchTimeoutTimer = setTimeout(() => {
+      if (this._batchSubIds.length === 0 && this._connected) {
+        logger.warn('[HeliusWS] ⚠️ 批量订阅5秒内未确认，降级到独立订阅模式');
+        this._fallbackToIndividual();
+      }
+    }, 5000);
+  }
+
+  _fallbackToIndividual() {
+    let i = 0;
+    for (const [addr] of this._tokens.entries()) {
+      setTimeout(() => {
+        if (this._tokens.has(addr) && this._connected) this._subscribeToken(addr);
+      }, i * 100);
+      i++;
+    }
+    logger.info(`[HeliusWS] 🔄 降级独立订阅 ${this._tokens.size} 个 token`);
   }
 
   subscribe(tokenAddress, symbol, onTrade) {
@@ -229,7 +265,7 @@ class HeliusTradeStream {
         }, 50);
       }
     }
-    logger.info('[HeliusWS] 📌 注册 %s，当前监控 %d 个', symbol, count);
+    logger.info(`[HeliusWS] 📌 注册 ${symbol}，当前监控 ${count} 个`);
   }
 
   unsubscribe(tokenAddress) {
@@ -242,7 +278,7 @@ class HeliusTradeStream {
         if (this._connected) this._subscribeBatch();
       }, 1000);
     }
-    logger.info('[HeliusWS] 🔕 移除 %s，剩余 %d 个', tokenAddress.slice(0, 8), this._tokens.size);
+    logger.info(`[HeliusWS] 🔕 移除 ${tokenAddress.slice(0,8)}，剩余 ${this._tokens.size} 个`);
   }
 
   _handleMessage(rawData) {
@@ -254,14 +290,28 @@ class HeliusTradeStream {
       if (!key) return;
       this._pendingSubs.delete(msg.id);
 
-      if (key === '__batch__') {
-        this._batchSubId = msg.result;
-        logger.info('[HeliusWS] ✅ 批量订阅确认 subId=%d，覆盖 %d 个 token', msg.result, this._tokens.size);
+      if (key.startsWith('__batch_')) {
+        if (typeof msg.result === 'number') {
+          this._batchSubIds.push(msg.result);
+          if (!this._batchSubId) this._batchSubId = msg.result;
+          clearTimeout(this._batchTimeoutTimer); // 收到确认，取消降级计时
+          logger.info(`[HeliusWS] ✅ 批量订阅块确认 subId=${msg.result} (共 ${this._batchSubIds.length} 块)`);
+        } else {
+          logger.warn(`[HeliusWS] ❌ 批量订阅块失败: ${JSON.stringify(msg).slice(0,200)}`);
+          // 降级：逐个独立订阅
+          let i = 0;
+          for (const [addr] of this._tokens.entries()) {
+            setTimeout(() => {
+              if (this._tokens.has(addr) && this._connected) this._subscribeToken(addr);
+            }, i * 100);
+            i++;
+          }
+        }
       } else {
         const info = this._tokens.get(key);
         if (info) {
           info.subId = msg.result;
-          logger.debug('[HeliusWS] ✅ 独立订阅确认 %s subId=%d', key.slice(0, 8), msg.result);
+          logger.debug(`[HeliusWS] ✅ 独立订阅确认 ${key.slice(0,8)} subId=${msg.result}`);
         }
       }
       return;
@@ -301,7 +351,7 @@ class HeliusTradeStream {
 
       if (!matched) this._stats.txSkipped++;
     } catch (err) {
-      logger.debug('[HeliusWS] 解析交易失败: %s', err.message);
+      logger.debug(`[HeliusWS] 解析交易失败: ${err.message}`);
     }
   }
 
@@ -376,7 +426,7 @@ class HeliusTradeStream {
       tokens:        this._tokens.size,
       confirmedSubs: this._batchSubId ? this._tokens.size : confirmedSubs,
       batchSubId:    this._batchSubId || null,
-      batchActive:   !!this._batchSubId,
+      batchActive:   this._batchSubIds.length > 0,
       retryCount:    this._retryCount,
       ...this._stats,
     };
