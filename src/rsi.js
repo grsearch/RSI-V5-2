@@ -330,7 +330,7 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState, rawCandles) {
                  reason: `PRICE_ABOVE_EMA99(price=${realtimePrice.toFixed(8)},ema99=${ema99.toFixed(8)})`, volume: volumeInfo };
       }
 
-      const volCheck = checkBuyVolume(closedCandles, null);
+      const volCheck = checkBuyVolume(_rawForVol, null); // 用原始K线（含量能）做量能判断
       volumeInfo.buyVol   = volCheck.buyVol;
       volumeInfo.sellVol  = volCheck.sellVol;
       volumeInfo.buyRatio = volCheck.ratio;

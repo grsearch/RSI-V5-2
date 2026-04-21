@@ -188,12 +188,43 @@ const priceStream = new BirdeyePriceStream();
 
 const _overviewCache = new Map(); // address → { fdv, liquidity, ts }
 
+// 从时间戳值中提取毫秒（自动判断秒/毫秒）
+function _toMs(val) {
+  if (!val || isNaN(val)) return null;
+  const n = Number(val);
+  if (!isFinite(n) || n <= 0) return null;
+  return n > 1e12 ? n : n * 1000; // 10位=秒级，13位=毫秒级
+}
+
+// 从 token_overview data 中提取 createdAt（尝试所有已知字段名）
+function _extractCreatedAt(data) {
+  // Birdeye 各版本字段名整理（按可能性排序）
+  const candidates = [
+    data.createdAt,
+    data.createAt,
+    data.creationTime,
+    data.mintTime,
+    data.firstMintTime,
+    data.mint_time,
+    data.listingTime,
+    data.listing_time,
+    data.extensions?.createdAt,
+    data.extensions?.creationTime,
+    data.extensions?.mintTime,
+  ];
+  for (const v of candidates) {
+    const ms = _toMs(v);
+    if (ms && ms > 1000000000000) return ms; // 合理范围：2001年以后
+  }
+  return null;
+}
+
 async function _fetchOverview(address) {
   const cached = _overviewCache.get(address);
   if (cached && Date.now() - cached.ts < FDV_CACHE_MS) return cached;
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 5000);
+  const timeout = setTimeout(() => controller.abort(), 8000);
   try {
     const url = `${BASE}/defi/token_overview?address=${address}`;
     const res = await fetch(url, {
@@ -207,19 +238,7 @@ async function _fetchOverview(address) {
     const json = await res.json();
     const data = json?.data || {};
 
-    // ★ Birdeye token_overview 代币创建时间字段名不固定，逐一尝试
-    // 字段可能是秒级或毫秒级时间戳
-    const rawTs = data.createdAt       // 最常见
-               ?? data.createAt        // 旧版拼写
-               ?? data.creationTime    // 部分版本
-               ?? data.extensions?.createdAt  // 嵌套结构
-               ?? data.extensions?.creationTime
-               ?? null;
-    let createdAt = null;
-    if (rawTs) {
-      // 判断是秒级（10位）还是毫秒级（13位）
-      createdAt = rawTs > 1e12 ? rawTs : rawTs * 1000;
-    }
+    let createdAt = _extractCreatedAt(data);
 
     const entry = {
       fdv:       data.fdv ?? data.mc ?? null,
@@ -227,23 +246,23 @@ async function _fetchOverview(address) {
       createdAt,
       ts:        Date.now(),
     };
+
     // 保留旧缓存中的 createdAt（不会变）
     if (!entry.createdAt && cached?.createdAt) entry.createdAt = cached.createdAt;
 
-    // ★ 调试：createdAt 找不到时打印完整字段（用 warn 确保能看到）
+    // createdAt 仍未找到 → 尝试 meta-data/single 接口
     if (!entry.createdAt) {
-      // 只打印一次完整 data（避免刷屏），后续只打印 keys
-      if (!_overviewCache._debuggedOnce) {
-        _overviewCache._debuggedOnce = true;
-        logger.warn('[Birdeye] overview %s createdAt未找到, 完整data: %s',
-          address.slice(0, 8), JSON.stringify(data).slice(0, 500));
-      } else {
-        logger.warn('[Birdeye] overview %s createdAt未找到, keys: %s',
-          address.slice(0, 8), Object.keys(data).join(','));
-      }
-    } else {
-      logger.info('[Birdeye] overview %s createdAt=%s (rawTs=%s)',
-        address.slice(0, 8), new Date(entry.createdAt).toISOString(), rawTs);
+      logger.debug('[Birdeye] overview %s 无createdAt，尝试meta-data接口 keys=%s',
+        address.slice(0, 8), Object.keys(data).join(','));
+      try {
+        const metaTs = await _fetchMetaCreatedAt(address);
+        if (metaTs) entry.createdAt = metaTs;
+      } catch (_) {}
+    }
+
+    if (entry.createdAt) {
+      logger.debug('[Birdeye] %s age=%sh',
+        address.slice(0, 8), Math.round((Date.now() - entry.createdAt) / 3600000));
     }
 
     _overviewCache.set(address, entry);
@@ -251,6 +270,27 @@ async function _fetchOverview(address) {
   } catch (err) {
     logger.warn('[Birdeye] _fetchOverview %s 失败: %s', address, err.message);
     return cached || null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// 备用：从 meta-data/single 接口获取 createdAt
+async function _fetchMetaCreatedAt(address) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+  try {
+    const url = `${BASE}/defi/v3/token/meta-data/single?address=${address}`;
+    const res = await fetch(url, {
+      headers: { 'X-API-KEY': BIRDEYE_KEY, 'x-chain': 'solana' },
+      signal: controller.signal,
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    const data = json?.data || {};
+    return _extractCreatedAt(data);
+  } catch (_) {
+    return null;
   } finally {
     clearTimeout(timeout);
   }

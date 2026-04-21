@@ -699,12 +699,16 @@ class TokenMonitor extends EventEmitter {
       const histFiltered = state.historicalCandles.filter(c => c.openTime < liveStart);
       closedCandles = [...histFiltered, ...liveClosed];
     }
-    // ★ 量能用：原始K线（含无价格的链上K线），历史K线在前，原始实时K线在后
-    let rawForVolume = rawClosedCandles;
+    // ★ 量能用：原始K线（含无价格的链上K线）+ 当前未收盘K线，历史K线在前
+    // currentCandle 包含当前5分钟窗口内最新的链上交易，必须纳入量能统计
+    const rawLiveAll = currentCandle
+      ? [...rawClosedCandles, currentCandle]
+      : rawClosedCandles;
+    let rawForVolume = rawLiveAll;
     if (state.historicalCandles && state.historicalCandles.length > 0) {
-      const liveStart = rawClosedCandles.length > 0 ? rawClosedCandles[0].openTime : Infinity;
+      const liveStart = rawLiveAll.length > 0 ? rawLiveAll[0].openTime : Infinity;
       const histFiltered = state.historicalCandles.filter(c => c.openTime < liveStart);
-      rawForVolume = [...histFiltered, ...rawClosedCandles];
+      rawForVolume = [...histFiltered, ...rawLiveAll];
     }
 
     // 7. RSI + 量能信号评估
