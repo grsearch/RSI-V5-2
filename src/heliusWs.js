@@ -474,6 +474,13 @@ class HeliusTradeStream {
 
       const isBuy  = tokenDelta > 0 && solDelta < 0;
       const isSell = tokenDelta < 0 && solDelta > 0;
+
+      // ★ 诊断：记录被跳过的交易（tokenDelta有值但方向无法识别）
+      if (!isBuy && !isSell && Math.abs(tokenDelta) > 1e-6) {
+        logger.debug('[HeliusTrade] 跳过无效交易 token=%s tokenDelta=%.6f solDelta=%.6f wsolNetDelta=%.6f sig=%s',
+          tokenAddress.slice(0,8), tokenDelta, solDelta, wsolNetDelta, signature?.slice(0,12)||'?');
+      }
+
       if (!isBuy && !isSell) continue;
 
       return {

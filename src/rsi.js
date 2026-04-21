@@ -467,22 +467,20 @@ function filterValidCandles(candles) {
  * @param {number} klineSec - K线宽度（秒）
  */
 function calcVolumeInfo(rawCandles, windowBars, klineSec) {
-  // 始终累加最近 N 根实时K线的量能（不因找到数据就停止）
-  // 保底看最近8根（约40分钟），确保新K线开始时不会断档
-  const lookback = Math.min(rawCandles.length, Math.max(windowBars, 8));
-  const wc = rawCandles.slice(-lookback);
+  // ★ 关键：先过滤出实时K线（非历史），再取最近N根
+  // rawCandles 里有大量历史K线(fromHistory=true)，若直接 slice(-8) 会全取到历史K线
+  const liveCandles = rawCandles.filter(c => !c.fromHistory);
+  const lookback = Math.min(liveCandles.length, Math.max(windowBars, 8));
+  const wc = liveCandles.slice(-lookback);
 
   let winBuy = 0, winSell = 0;
   for (const c of wc) {
-    if (c.fromHistory) continue; // 历史K线无方向数据
     winBuy  += (c.buyVolume  || 0);
     winSell += (c.sellVolume || 0);
   }
 
   const winTotal = winBuy + winSell;
-  const liveCandlesInWindow = wc.filter(c => !c.fromHistory);
-  const currentVol = liveCandlesInWindow.length > 0
-    ? liveCandlesInWindow[liveCandlesInWindow.length - 1].volume || 0 : 0;
+  const currentVol = wc.length > 0 ? wc[wc.length - 1].volume || 0 : 0;
 
   return {
     currentVol,
