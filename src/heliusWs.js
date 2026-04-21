@@ -129,6 +129,15 @@ class HeliusTradeStream {
     const safeUrl = wsUrl.replace(/api-key=[a-f0-9-]+/i, 'api-key=***');
     logger.info('[HeliusWS] 连接 %s (类型: %s) ...', safeUrl, this._connType);
 
+    // 每60秒打印一次订阅状态，方便诊断
+    if (!this._statsTimer) {
+      this._statsTimer = setInterval(() => {
+        const s = this.getStats();
+        logger.info('[HeliusWS] 状态: tokens=%d confirmedSubs=%d batchSubId=%s txReceived=%d txMatched=%d txParsed=%d',
+          s.tokens, s.confirmedSubs, s.batchSubId || 'none', s.txReceived, s.txMatched, s.txParsed);
+      }, 60000);
+    }
+
     this._ws = new WebSocket(wsUrl);
 
     this._ws.on('open', () => {
@@ -597,12 +606,15 @@ class HeliusTradeStream {
     for (const info of this._tokens.values()) {
       if (info.subId) confirmedSubs++;
     }
+    const batchActive = !!this._batchSubId;
     return {
       connected:     this._connected,
       connType:      this._connType,
       subMode:       this._activeMode,
       tokens:        this._tokens.size,
       confirmedSubs: this._isPumpMode() ? (this._pumpSubId ? 1 : 0) : confirmedSubs,
+      batchSubId:    this._batchSubId || null,
+      batchActive,
       retryCount:    this._retryCount,
       ...this._stats,
     };
