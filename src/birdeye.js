@@ -206,15 +206,46 @@ async function _fetchOverview(address) {
     }
     const json = await res.json();
     const data = json?.data || {};
+
+    // ★ Birdeye token_overview 代币创建时间字段名不固定，逐一尝试
+    // 字段可能是秒级或毫秒级时间戳
+    const rawTs = data.createdAt       // 最常见
+               ?? data.createAt        // 旧版拼写
+               ?? data.creationTime    // 部分版本
+               ?? data.extensions?.createdAt  // 嵌套结构
+               ?? data.extensions?.creationTime
+               ?? null;
+    let createdAt = null;
+    if (rawTs) {
+      // 判断是秒级（10位）还是毫秒级（13位）
+      createdAt = rawTs > 1e12 ? rawTs : rawTs * 1000;
+    }
+
     const entry = {
       fdv:       data.fdv ?? data.mc ?? null,
       liquidity: data.liquidity ?? data.lp ?? null,
-      // ★ V5: 代币创建时间（秒级时间戳 → 毫秒）
-      createdAt: data.createdAt ? data.createdAt * 1000 : (data.createAt ? data.createAt * 1000 : null),
+      createdAt,
       ts:        Date.now(),
     };
     // 保留旧缓存中的 createdAt（不会变）
     if (!entry.createdAt && cached?.createdAt) entry.createdAt = cached.createdAt;
+
+    // ★ 调试：createdAt 找不到时打印完整字段（用 warn 确保能看到）
+    if (!entry.createdAt) {
+      // 只打印一次完整 data（避免刷屏），后续只打印 keys
+      if (!_overviewCache._debuggedOnce) {
+        _overviewCache._debuggedOnce = true;
+        logger.warn('[Birdeye] overview %s createdAt未找到, 完整data: %s',
+          address.slice(0, 8), JSON.stringify(data).slice(0, 500));
+      } else {
+        logger.warn('[Birdeye] overview %s createdAt未找到, keys: %s',
+          address.slice(0, 8), Object.keys(data).join(','));
+      }
+    } else {
+      logger.info('[Birdeye] overview %s createdAt=%s (rawTs=%s)',
+        address.slice(0, 8), new Date(entry.createdAt).toISOString(), rawTs);
+    }
+
     _overviewCache.set(address, entry);
     return entry;
   } catch (err) {

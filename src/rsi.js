@@ -104,14 +104,17 @@ function checkBuyVolume(closedCandles, currentCandle) {
     return { pass: false, reason: 'VOL_INSUFFICIENT_DATA', buyVol: 0, sellVol: 0, ratio: 0 };
   }
 
-  const windowCandles = allCandles.slice(-windowBars);
-
-  let totalBuy  = 0;
-  let totalSell = 0;
-  for (const c of windowCandles) {
-    if (c.fromHistory) continue;  // 历史K线无买卖方向数据，跳过
-    totalBuy  += (c.buyVolume  || 0);
-    totalSell += (c.sellVolume || 0);
+  // ★ 动态扩展窗口：若标准窗口内全是历史K线，往前多看最多8根
+  let totalBuy = 0, totalSell = 0;
+  for (let wb = windowBars; wb <= Math.min(allCandles.length, 8); wb++) {
+    totalBuy = 0; totalSell = 0;
+    const wc = allCandles.slice(-wb);
+    for (const c of wc) {
+      if (c.fromHistory) continue;  // 历史K线无买卖方向数据，跳过
+      totalBuy  += (c.buyVolume  || 0);
+      totalSell += (c.sellVolume || 0);
+    }
+    if (totalBuy + totalSell > 0) break; // 找到实时数据，停止扩展
   }
 
   const total = totalBuy + totalSell;
@@ -275,27 +278,34 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState) {
 
   // 量能信息
   // ★ 只统计实时K线（fromHistory !== true）的买卖量，历史K线没有方向数据
+  // ★ 动态扩展窗口：从最近1根开始，若全是历史K线则往前多看，直到找到实时数据或扫完所有K线
   const latestCandle = closedCandles[len - 1];
   const windowBars = Math.max(1, Math.ceil(VOL_WINDOW_SEC / KLINE_SEC));
-  const windowCandles = closedCandles.slice(-windowBars);
-  let winBuy = 0, winSell = 0;
-  for (const c of windowCandles) {
-    if (c.fromHistory) continue;   // 跳过历史K线，它们无买卖方向数据
-    winBuy  += (c.buyVolume  || 0);
-    winSell += (c.sellVolume || 0);
+  // 先用标准窗口，若无实时数据则逐步扩展到最多8根（约40分钟）
+  let winBuy = 0, winSell = 0, actualWindowBars = windowBars;
+  for (let wb = windowBars; wb <= Math.min(len, 8); wb++) {
+    winBuy = 0; winSell = 0;
+    const wc = closedCandles.slice(-wb);
+    for (const c of wc) {
+      if (c.fromHistory) continue;   // 跳过历史K线，它们无买卖方向数据
+      winBuy  += (c.buyVolume  || 0);
+      winSell += (c.sellVolume || 0);
+    }
+    actualWindowBars = wb;
+    if (winBuy + winSell > 0) break; // 找到实时数据了，停止扩展
   }
   const winTotal = winBuy + winSell;
-  // currentVol 也只取实时K线的量（历史K线volume是总量非方向量，意义不同）
-  const liveLatest = windowCandles.filter(c => !c.fromHistory);
-  const currentVol = liveLatest.length > 0
-    ? liveLatest[liveLatest.length - 1].volume || 0
+  // currentVol 取最近实时K线的量
+  const recentLive = closedCandles.slice(-actualWindowBars).filter(c => !c.fromHistory);
+  const currentVol = recentLive.length > 0
+    ? recentLive[recentLive.length - 1].volume || 0
     : 0;
   const volumeInfo = {
     currentVol,
     buyVol:  winBuy,
     sellVol: winSell,
     buyRatio: winTotal > 0 ? winBuy / winTotal : 0,
-    windowSec: VOL_WINDOW_SEC,
+    windowSec: actualWindowBars * KLINE_SEC,
   };
 
   // ── SELL 优先（持仓中） ────────────────────────────────────────
@@ -477,24 +487,33 @@ function buildCandles(ticks, intervalSec = KLINE_SEC) {
 }
 
 /**
- * 过滤K线用于 RSI/EMA 计算：
- *   - 有价格数据的K线：正常保留
- *   - 只有链上交易、无价格的K线：把量能合并到前一根有价格的K线，自身丢弃
- * 这样既保证 RSI 计算有正确的 close 价格，又不丢失链上交易的量能数据
+ * 过滤K线：保留有价格数据的K线，同时保留有量能数据的K线（即使没有价格）
+ * 对于只有链上交易、无价格的K线：用前一根K线的 close 补全价格，参与量能统计
+ * 这样既保证 RSI 计算不出错，又不丢失链上交易的量能数据（Openclaw方案）
  */
 function filterValidCandles(candles) {
   const valid = [];
+  let lastClose = null;
+
   for (const c of candles) {
     if (c.open !== null && c.close !== null) {
+      // 正常K线：直接保留，更新 lastClose
       valid.push(c);
-    } else if (valid.length > 0) {
-      // 无价格K线：量能并入前一根有效K线，防止链上交易数据丢失
-      const prev = valid[valid.length - 1];
-      prev.volume     = (prev.volume     || 0) + (c.volume     || 0);
-      prev.buyVolume  = (prev.buyVolume  || 0) + (c.buyVolume  || 0);
-      prev.sellVolume = (prev.sellVolume || 0) + (c.sellVolume || 0);
+      lastClose = c.close;
+    } else if (c.volume > 0 || c.buyVolume > 0 || c.sellVolume > 0) {
+      // 只有链上量能、无价格的K线：用上一根的收盘价补全，保留量能数据
+      if (lastClose !== null) {
+        valid.push({
+          ...c,
+          open:  lastClose,
+          high:  lastClose,
+          low:   lastClose,
+          close: lastClose,
+        });
+      }
+      // lastClose 不变（价格没有新数据）
     }
-    // 若 valid 为空且无价格，直接丢弃（没有前一根可合并）
+    // 既无价格又无量能的K线：直接丢弃
   }
   return valid;
 }

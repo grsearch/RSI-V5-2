@@ -1028,8 +1028,8 @@ class TokenMonitor extends EventEmitter {
   // ── ★ V5: FDV/LP/Age 巡检（分散请求，每轮间隔 OVERVIEW_PATROL_SEC）──────
 
   _startOverviewPatrol() {
-    // 启动后延迟30秒开始第一轮巡检（等WS连接稳定）
-    this._patrolTimer = setTimeout(() => this._runOverviewPatrol(), 30000);
+    // 启动后延迟5秒开始第一轮巡检（尽快拿到Age/FDV/LP数据）
+    this._patrolTimer = setTimeout(() => this._runOverviewPatrol(), 5000);
   }
 
   async _runOverviewPatrol() {
@@ -1052,6 +1052,8 @@ class TokenMonitor extends EventEmitter {
       if (!state) continue;
 
       try {
+        // ★ createdAt 为空时强制绕过缓存重新拉取（确保Age数据能拿到）
+        if (!state.createdAt) birdeye.clearCache(address);
         const overview = await birdeye.getOverview(address);
         if (!overview) continue;
 
